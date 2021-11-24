@@ -3,6 +3,7 @@ Utilities for parsing the corefile, operating with memory ranges
 and other low level stuff.
 '''
 
+import enum
 from io import SEEK_CUR, SEEK_END, SEEK_SET, BytesIO, RawIOBase, UnsupportedOperation
 import mmap
 import struct
@@ -267,16 +268,59 @@ class Prstatus(object):
         common = read_struct(st, '<' + '3i' + 'h2x' + 'QQ' + '4I')
         common = (Siginfo(*common[:3]),) + common[3:]
         times = [ parse_old_timeval(st) for _ in range(4) ]
+        # FIXME: parse siginfo note too (same info?)
 
         # parse GP regs
         regs = X64_REGSTATE
         regs = dict(zip(regs, read_struct(st, f'<{len(regs)}Q')))
+        # FIXME: parse FP regs and XSAVE regs too
 
         # parse rest
         pr_fpvalid, = read_struct(st, '<i4x')
 
         assert not st.read()
         return Prstatus(*common, *times, regs, pr_fpvalid)
+
+def parse_auxv_note(note):
+    # pyelftools gives rawdata as a 'string', convert back to bytes
+    st = BytesIO(note['n_descdata'].encode('latin-1'))
+    result = []
+    while (pair := read_struct(st, '<2Q'))[0]: result.append(pair)
+    rdict = dict(result)
+    assert len(result) == len(rdict) and not st.read()
+    return rdict
+
+class AuxvField(enum.Enum):
+    IGNORE        =  1    # entry should be ignored
+    EXECFD        =  2    # file descriptor of program
+    PHDR          =  3    # program headers for program
+    PHENT         =  4    # size of program header entry
+    PHNUM         =  5    # number of program headers
+    PAGESZ        =  6    # system page size
+    BASE          =  7    # base address of interpreter
+    FLAGS         =  8    # flags
+    ENTRY         =  9    # entry point of program
+    NOTELF        = 10    # program is not ELF
+    UID           = 11    # real uid
+    EUID          = 12    # effective uid
+    GID           = 13    # real gid
+    EGID          = 14    # effective gid
+    PLATFORM      = 15    # string identifying CPU for optimizations
+    HWCAP         = 16    # arch dependent hints at CPU capabilities
+    CLKTCK        = 17    # frequency at which times() increments
+    # values 18 through 22 are reserved
+    SECURE        = 23    # secure mode boolean
+    BASE_PLATFORM = 24    # string identifying real platform, may differ from AT_PLATFORM
+    RANDOM        = 25    # address of 16 random bytes
+    HWCAP2        = 26    # extension of AT_HWCAP
+
+    EXECFN        = 31    # filename of program
+
+    # arch-specific:
+    SYSINFO       = 32    # x86-32 only
+    SYSINFO_EHDR  = 33
+
+    MINSIGSTKSZ   = 51    # minimal stack size for signal delivery
 
 # ABI-specific
 

@@ -17,6 +17,7 @@ from .utils import \
     UnicornIO, read_struct, write_struct, read_bstr, read_str, write_str, \
     sort_and_ensure_disjoint, VMA, \
     parse_load_segments, parse_file_note, Prstatus, FileMapping, \
+    parse_auxv_note, AuxvField, \
     mmapsize, elf_flags_to_uc_prot, SYSV_AMD_PARAM_REGS
 
 # FIXME: a lot of these asserts should be exceptions, we should have a class
@@ -40,6 +41,7 @@ class EmuCore(object):
     # parsed info
     threads: list[Prstatus]
     mappings: list[FileMapping]
+    auxv: dict[int, int]
 
     def __init__(
         self, filename: str,
@@ -66,7 +68,9 @@ class EmuCore(object):
         self.threads = list(map(Prstatus.load,
             filter(lambda n: n['n_type'] == 'NT_PRSTATUS', notes)))
         # process
-        # TODO: auxv
+        # FIXME: parse PRPSINFO
+        self.auxv = parse_auxv_note(
+            next( n for n in notes if n['n_type'] == 'NT_AUXV' ))
 
         # Initialize emulator instance
         self.emu = Uc(uc.UC_ARCH_X86, uc.UC_MODE_64)
@@ -77,6 +81,8 @@ class EmuCore(object):
 
         # Map everything into emulator
         print('Mapping memory...')
+        if self.auxv[AuxvField.PAGESZ.value] != mmap.PAGESIZE:
+            print('WARNING: page size should match with the host')
         assert self.emu.query(uc.UC_QUERY_PAGE_SIZE) <= mmap.PAGESIZE
         # (first core segments, then RO mappings over any uncovered areas)
         self.__load_core_segments()
