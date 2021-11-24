@@ -5,10 +5,12 @@ and other low level stuff.
 
 import enum
 from io import SEEK_CUR, SEEK_END, SEEK_SET, BytesIO, RawIOBase, UnsupportedOperation
+import itertools
 import mmap
 import struct
 from typing import Any, BinaryIO, Callable, Iterator, NamedTuple, TypeVar, Union, Optional  
 from elftools.elf.elffile import ELFFile
+from elftools.elf.structs import ELFStructs
 from elftools.elf.segments import Segment
 from unicorn.unicorn import uc, Uc, x86_const
 from elftools.elf.constants import P_FLAGS
@@ -321,6 +323,40 @@ class AuxvField(enum.Enum):
     SYSINFO_EHDR  = 33
 
     MINSIGSTKSZ   = 51    # minimal stack size for signal delivery
+
+# parse lone ELF structures
+
+def parse_program_header(structs: ELFStructs, st: BinaryIO, num_entries: Optional[int]=None) -> Iterator[dict]:
+    for _ in itertools.count() if num_entries is None else range(num_entries):
+        yield structs.Elf_Phdr.parse_stream(st)
+
+def parse_dynamic_section(structs: ELFStructs, st: BinaryIO, type=None) -> Iterator[dict]:
+    while (x := structs.Elf_Dyn.parse_stream(st))['d_tag'] != 'DT_NULL':
+        if type is None or type == x['d_tag']: yield x
+
+# "standard" debugger interface
+# (https://gitweb.gentoo.org/fork/glibc.git/tree/elf/rtld-debugger-interface.txt)
+
+class RtState(enum.Enum):
+    CONSISTENT = 0   # Mapping change is complete
+    ADD = 1          # Beginning to add a new object
+    DELETE = 2       # Beginning to remove an object mapping
+
+class RtLoadedObject(NamedTuple):
+    addr: int    # Difference between the address in the ELF file and the addresses in memory
+    name: bytes  # Absolute file name object was found in
+    ld: int      # Dynamic section of the shared object
+
+    @staticmethod
+    def iterate(st: BinaryIO, node: int) -> Iterator['RtLoadedObject']:
+        # FIXME: use l_prev for consistency checks or fixups in case of unreliable state?
+        while node:
+            st.seek(node)
+            l_addr, l_name, l_ld, l_next, l_prev = read_struct(st, '<5Q')
+            st.seek(l_name)
+            l_name = bytes(read_bstr(st))
+            yield RtLoadedObject(l_addr, l_name, l_ld)
+            node = l_next
 
 # ABI-specific
 

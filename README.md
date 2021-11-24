@@ -12,7 +12,7 @@ Features:
  - Automatically loads mapped files
  - Supports inspecting on different machine
  - Independent of host*
- - Not dependent on debug info
+ - Debug info isn't required
 
 (*) Page size should be the same.
 

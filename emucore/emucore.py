@@ -18,6 +18,7 @@ from .utils import \
     sort_and_ensure_disjoint, VMA, \
     parse_load_segments, parse_file_note, Prstatus, FileMapping, \
     parse_auxv_note, AuxvField, \
+    parse_program_header, parse_dynamic_section, RtState, RtLoadedObject, \
     mmapsize, elf_flags_to_uc_prot, SYSV_AMD_PARAM_REGS
 
 # FIXME: a lot of these asserts should be exceptions, we should have a class
@@ -42,6 +43,7 @@ class EmuCore(object):
     threads: list[Prstatus]
     mappings: list[FileMapping]
     auxv: dict[int, int]
+    loaded_objects: list[RtLoadedObject]
 
     def __init__(
         self, filename: str,
@@ -87,6 +89,9 @@ class EmuCore(object):
         # (first core segments, then RO mappings over any uncovered areas)
         self.__load_core_segments()
         self.__load_mappings(**mapping_load_kwargs)
+
+        # Load symbols from binary and loaded objects
+        self.__load_symbols()
 
         # Post-load fixups
         if patch_libc:
@@ -197,6 +202,59 @@ class EmuCore(object):
         stream.read_str = lambda *args, **kwargs: read_str(stream, *args, **kwargs)
         stream.write_str = lambda *args, **kwargs: write_str(stream, *args, **kwargs)
         return stream
+
+    def __load_symbols(self):
+        '''Find info about loaded objects and load their symbols'''
+        # First we need to parse the binary ELF. This is essential;
+        # without this we can't use the "debugger interface" to find
+        # the rest of the objects, so no symbols at all.
+
+        # Use auxv to locate program header of main executable, parse them
+        # (we are using the raw structs here and not ELFFile, because this is
+        # not the ELF file as seen on disk but its loaded version)
+        phdr_base = self.auxv[AuxvField.PHDR.value]
+        phdr_num = self.auxv[AuxvField.PHNUM.value]
+        phdr = parse_program_header(self.core.structs, self.mem(phdr_base), phdr_num)
+        # FIXME: use VMAs to locate base of executable, we'll need it to translate vaddrs, how tf does ld do it??
+        _, vma = self.get_mapping(phdr_base)
+        main_base = vma.start - vma.offset
+
+        # Find r_debug (debugger interface entry point) through the DT_DEBUG tag
+        try:
+            dyn_seg = next(seg['p_vaddr'] for seg in phdr if seg['p_type'] == 'PT_DYNAMIC')
+            dt_debug = next(parse_dynamic_section(self.core.structs,
+                self.mem(main_base + dyn_seg), 'DT_DEBUG'))['d_ptr']
+        except StopIteration:
+            print('WARNING: cannot find DT_DEBUG tag in binary. either it is a '
+                'statically linked executable or it does not conform to the debugger '
+                'interface, in which case info about shared libraries will be lost')
+            # FIXME: for statically-linked executables, verify that they really don't
+            # have a PT_DYNAMIC segment and maybe fall back to loading symbol table
+            # by looking through the sections instead of the dynamic segment
+            return
+        if not dt_debug:
+            print('WARNING: DT_DEBUG tag not initialized. either linker does not '
+                'follow debugger interface or who knows')
+            return
+
+        # Parse debug interface data
+        r_version, r_map, r_brk, r_state, r_ldbase = self.mem(dt_debug).read_struct('<i4xQQi4xQ')
+        if r_version != 1:
+            print(f'WARNING: unexpected/unsupported debugger interface version {r_version}. '
+                'will try to parse anyway...')
+        if r_state != RtState.CONSISTENT.value:
+            print('WARNING: coredump was taken when loaded objects list was in '
+                'an unconsistent state. will try to parse anyway...')
+        loaded_objects = list(RtLoadedObject.iterate(self.mem(), r_map))
+
+        # Actually load the symbols of each object
+        self.loaded_objects = { obj.addr:
+            self.__load_symbols_for(obj) for obj in loaded_objects }
+
+    def __load_symbols_for(obj: RtLoadedObject):
+        # Load dynamic symbols (this is guaranteed info, it doesn't depend
+        # on mappings / disk files at all, so start by loading these first)
+        return obj
 
     def __patch_libc(self):
         pass # TODO
