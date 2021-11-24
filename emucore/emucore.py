@@ -4,6 +4,7 @@ Main module, exposes public API
 
 from collections import defaultdict
 import ctypes
+from io import DEFAULT_BUFFER_SIZE, BufferedRandom, BytesIO
 import os
 from typing import Callable, Optional, Union
 from unicorn.unicorn import Uc, UcError, uc, x86_const
@@ -13,6 +14,7 @@ import struct
 import bisect
 
 from .utils import \
+    UnicornIO, read_struct, write_struct, read_bstr, read_str, write_str, \
     sort_and_ensure_disjoint, VMA, \
     parse_load_segments, parse_file_note, Prstatus, FileMapping, \
     mmapsize, elf_flags_to_uc_prot, SYSV_AMD_PARAM_REGS
@@ -171,6 +173,25 @@ class EmuCore(object):
                 ptr = ctypes.byref((ctypes.c_char*1).from_buffer(mm, vma.offset))
                 self.emu.mem_map_ptr(vma.start, vma.size, prot, ptr)
 
+    def mem(self, start: int=0, size: Optional[int]=None, offset: int=0, buffer_size: int=DEFAULT_BUFFER_SIZE):
+        '''Returns a binary I/O stream over (a region of) memory
+
+        First two arguments restrict the accessible memory range,
+        with `start` being exposed at offset 0.
+
+        The `offset` parameter calls seek() on the returned stream.
+        '''
+        stream = UnicornIO(self.emu, start, size, offset)
+        # FIXME: BufferedRandom fails with some obscure exception from native code...
+        #stream = BufferedRandom(stream, buffer_size) if buffer_size > 0 else stream
+        # inject convenience methods (FIXME: more elegant way?)
+        stream.read_struct = lambda *args, **kwargs: read_struct(stream, *args, **kwargs)
+        stream.write_struct = lambda *args, **kwargs: write_struct(stream, *args, **kwargs)
+        stream.read_bstr = lambda *args, **kwargs: read_bstr(stream, *args, **kwargs)
+        stream.read_str = lambda *args, **kwargs: read_str(stream, *args, **kwargs)
+        stream.write_str = lambda *args, **kwargs: write_str(stream, *args, **kwargs)
+        return stream
+
     def __patch_libc(self):
         pass # TODO
 
@@ -254,25 +275,6 @@ class EmuCore(object):
             raise Exception(f'Limits exhausted ({self.format_exec_ctx()})')
         assert emu.reg_read(x86_const.UC_X86_REG_RSP) == stack_entry + 8
         return emu.reg_read(x86_const.UC_X86_REG_RAX)
-
-    # MEMORY READING HELPERS
-    # FIXME: add method that returns BytesIO (offset=0, size=None aka until end)
-    # then remove read() and move the other methods into utils
-
-    def read(self, addr: int, size: int) -> bytearray:
-        return self.emu.mem_read(addr, size)
-
-    def read_bstr(self, addr: int, block_size: int=64, max_size: Optional[int]=1024*1024) -> bytes:
-        res = b''
-        while max_size is None or len(res) < max_size:
-            block = self.read(addr + len(res), block_size)
-            if (idx := block.find(b'\0')) != -1:
-                return res + block[:idx]
-            res += block
-        raise Exception('no string terminator found within max_size')
-
-    def read_str(self, addr: int, encoding='utf-8', **kwargs) -> str:
-        return self.read_bstr(addr, **kwargs).decode(encoding)
 
 
 # stop reasons:

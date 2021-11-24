@@ -3,22 +3,115 @@ Utilities for parsing the corefile, operating with memory ranges
 and other low level stuff.
 '''
 
-from io import BytesIO
+from io import SEEK_CUR, SEEK_END, SEEK_SET, BytesIO, RawIOBase, UnsupportedOperation
 import mmap
 import struct
-from typing import BinaryIO, Callable, Iterator, NamedTuple, TypeVar
+from typing import Any, BinaryIO, Callable, Iterator, NamedTuple, TypeVar, Union, Optional  
 from elftools.elf.elffile import ELFFile
 from elftools.elf.segments import Segment
-from unicorn.unicorn import uc, x86_const
+from unicorn.unicorn import uc, Uc, x86_const
 from elftools.elf.constants import P_FLAGS
 from dataclasses import dataclass
 
-def read_struct(st: BinaryIO, fmt: str):
-    desc = struct.Struct(fmt)
-    return desc.unpack(st.read(desc.size))
-
 # get real size of mmap'ed region, i.e. rounding up by PAGESIZE
 mmapsize = lambda mm: ((mm.size() - 1) // mmap.PAGESIZE + 1) * mmap.PAGESIZE
+
+# general serialization utilities
+
+def read_struct(st: BinaryIO, fmt: Union[str, struct.Struct]):
+    desc = struct.Struct(fmt) if isinstance(fmt, str) else fmt
+    return desc.unpack(st.read(desc.size))
+
+def write_struct(st: BinaryIO, fmt: Union[str, struct.Struct], *v: Any):
+    desc = struct.pack(fmt, *v) if isinstance(fmt, str) else fmt.pack(*v)
+    return st.write(desc)
+
+def read_bstr(st: BinaryIO, allow_trunc: bool=False, max_size: Optional[int]=1024*1024) -> bytearray:
+    res = bytearray()
+    while (max_size is None or len(res) < max_size) and (car := st.read(1)):
+        if not car[0]: return res
+        res.append(car[0])
+    if allow_trunc: return res
+    raise Exception('no string terminator found within max_size')
+
+def read_str(*kargs, encoding: str='utf-8', errors: str='strict', **kwargs) -> str:
+    return read_bstr(*kargs, **kwargs).decode(encoding, errors)
+
+def write_str(
+    st: BinaryIO, x: Union[str, bytes, bytearray],
+    encoding: str='utf-8', errors: str='strict',
+    allow_invalid: bool=False,
+):
+    x = x.encode(encoding, errors) if isinstance(x, str) else x
+    x = memoryview(x).cast('B')
+    if not allow_invalid: assert all(b for b in x)
+    fx = bytearray(len(x) + 1)
+    fx[:len(x)] = x
+    return st.write(fx)
+
+class UnicornIO(RawIOBase):
+    '''Exposes (part of) the memory of a Unicorn engine as a raw I/O stream'''
+    uc: Uc
+    start: int
+    size: int
+    offset: int
+
+    def __init__(self, uc: Uc, start: int=0, size: Optional[int]=None, offset: int=0):
+        if size is None:
+            size = (1 << 64) - start
+        assert 0 <= start <= (1 << 64)
+        assert 0 <= size <= (1 << 64) - start
+        self.uc, self.start, self.size, self.offset = uc, start, size, 0
+        self.seek(offset)
+
+    def readable(self):
+        return True
+    def writable(self):
+        return True
+    def seekable(self):
+        return True
+
+    def tell(self):
+        return self.offset
+
+    def seek(self, offset: int, whence: int=SEEK_SET):
+        assert isinstance(offset, int)
+        offset += { SEEK_SET: 0, SEEK_CUR: self.offset, SEEK_END: self.size }[whence]
+        if not (0 <= offset <= self.size):
+            # FIXME: should we also check it's a mapped position?
+            raise ValueError(f'out-of-bounds offset: {offset}')
+        self.offset = offset
+
+    def truncate(self, size=None):
+        raise UnsupportedOperation('fixed memory region, truncation not supported')
+
+    # FIXME: check readable, writeable, seekable return True, check reexports accessible
+    def read(self, size=-1) -> bytearray:
+        assert isinstance(size, int)
+        max_size = self.size - self.offset
+        size = max_size if size == -1 else min(size, max_size)
+        addr = self.start + self.offset
+        assert 0 <= size < (1 << 64) and 0 <= addr < (1 << 64)
+        result = self.uc.mem_read(addr, size)
+        self.offset += size
+        return result
+
+    def write(self, b):
+        max_size = self.size - self.offset
+        b = memoryview(b).cast('B')
+        if len(b) > max_size:
+            raise ValueError(f'buffer of size {len(b)} exceeds bounds')
+        addr = self.start + self.offset
+        assert 0 <= addr < (1 << 64)
+        self.uc.mem_write(addr, bytes(b))  # FIXME: find a way to prevent copy
+        self.offset += len(b)
+
+    def readall(self):
+        return self.read()
+
+    def readinto(self, b):
+        b = memoryview(b).cast('B')
+        b[:] = self.read(len(b))  # FIXME: prevent copy
 
 # operations with memory ranges
 
