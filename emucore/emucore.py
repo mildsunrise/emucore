@@ -8,7 +8,7 @@ from io import DEFAULT_BUFFER_SIZE, BufferedRandom, BytesIO
 import os
 from typing import Callable, Optional, Union
 from unicorn.unicorn import Uc, UcError, uc, x86_const
-from elftools.elf import elffile
+from elftools.elf import elffile, sections
 import mmap
 import struct
 import bisect
@@ -34,23 +34,26 @@ from .utils import \
 REQUIRED_PROT = mmap.PROT_READ | mmap.PROT_WRITE
 
 class EmuCore(object):
+    SymbolEntry = tuple[RtLoadedObject, dict]
+
     # open resources (FIXME: make this class a context manager)
     emu: Uc
     core: elffile.ELFFile
-    mmaps: list[mmap.mmap]
+    core_mm: mmap.mmap
+    mappings_mm: dict[bytes, tuple[bytes, mmap.mmap]]
 
     # parsed info
     threads: list[Prstatus]
     mappings: list[FileMapping]
     auxv: dict[int, int]
+    # WARNING: below properties will be absent if __load_symbols() failed
     loaded_objects: list[RtLoadedObject]
+    symbols: dict[str, list[SymbolEntry]]
 
     def __init__(
         self, filename: str,
         patch_libc: bool=True, mapping_load_kwargs={},
     ):
-        self.mmaps = []
-
         # Start by opening the core file
         self.core = elffile.ELFFile(open(filename, 'rb'))
         assert self.core['e_ident']['EI_OSABI'] in {'ELFOSABI_SYSV', 'ELFOSABI_LINUX'}, \
@@ -102,7 +105,7 @@ class EmuCore(object):
         load_segs = parse_load_segments(self.core)
         print(f'Mapping {len(load_segs)} LOAD segments...')
         corefd = self.core.stream.fileno()
-        self.mmaps.append(mm := mmap.mmap(corefd, 0, mmap.MAP_PRIVATE, REQUIRED_PROT))
+        self.core_mm = mm = mmap.mmap(corefd, 0, mmap.MAP_PRIVATE, REQUIRED_PROT)
         for vma, flags in load_segs:
             prot = elf_flags_to_uc_prot(flags)
             assert vma.offset_end <= mmapsize(mm), 'segment exceeds file, malformed ELF'
@@ -113,7 +116,7 @@ class EmuCore(object):
         whitelist: list[Union[str, bytes]]=[],
         blacklist: list[Union[str, bytes]]=['/dev/', '/proc/', '/sys/'],
         skip_invalid: bool=True, skip_special: bool=True,
-        filename_map: Callable[[str], Optional[str]] = lambda x: x,
+        filename_map: Callable[[bytes], Optional[Union[str, bytes]]] = lambda x: x,
     ):
         '''Read VMAs from core and map the associated files from disk
 
@@ -129,8 +132,10 @@ class EmuCore(object):
         to transform mapped filenames. The function will be called with the original
         filename and must return the filename to access on disk, or None to skip the file.
         '''
-        blacklist = [ x.encode() if isinstance(x, str) else x for x in blacklist ]
-        whitelist = [ x.encode() if isinstance(x, str) else x for x in whitelist ]
+        ensure_bytes = lambda x: x.encode() if isinstance(x, str) else x
+        blacklist = list(map(ensure_bytes, blacklist))
+        whitelist = list(map(ensure_bytes, whitelist))
+        filename_map = (lambda o: lambda fn: ensure_bytes(o(fn)))(filename_map)
 
         # remove mappings that overlap with already loaded regions
         regions = sort_and_ensure_disjoint((s, e+1) for s, e, _ in self.emu.mem_regions())
@@ -145,8 +150,9 @@ class EmuCore(object):
                     start, offset = regend, offset + (regend - start)
                 regions.pop(0)
 
-        # group by file, simplify
-        file_mappings: dict[bytes, list[VMA]] = defaultdict(lambda: [])
+        # collect simplified mappings for each file
+        # (note that we keep all files, even if they no longer have VMAs)
+        file_mappings: dict[bytes, list[VMA]] = { fn: [] for fn, _ in self.mappings }
         for fname, vma in mappings:
             file_mappings[fname].append(vma)
         file_mappings = { k: VMA.simplify(v) for k, v in file_mappings.items() }
@@ -163,24 +169,25 @@ class EmuCore(object):
             any(pref.startswith(fn) for pref in whitelist) or not file_skipped(fn)
         mapped_filenames = { fn: fn2 for fn in file_mappings
             if file_filter(fn) and (fn2 := filename_map(fn)) != None }
-        print('Skipped files:\n{}'.format('\n'.join(
+        print('Skipped files with VMAs:\n{}'.format('\n'.join(
             f' - {fn.decode(errors="replace")}'
-                for fn in set(file_mappings) - set(mapped_filenames) )))
-        file_mappings = { mapped_filenames[fn]: v for fn, v in file_mappings.items()
-            if fn in mapped_filenames }
+                for fn, vmas in file_mappings.items() if fn not in mapped_filenames and vmas )))
+        file_mappings = { fn: v for fn, v in file_mappings.items() if fn in mapped_filenames }
         total_mappings = sum(len(v) for v in file_mappings.values())
         print(f'Mapping {len(file_mappings)} files, {total_mappings} VMAs...')
 
         # map files (FIXME: catch open() errors and move on)
-        for fname, vmas in file_mappings.items():
-            with open(fname, 'rb') as f:
-                self.mmaps.append(mm := mmap.mmap(f.fileno(), 0, mmap.MAP_PRIVATE, REQUIRED_PROT))
+        self.mappings_mm = {}
+        for fn, vmas in file_mappings.items():
+            with open(mapped_filenames[fn], 'rb') as f:
+                mm = mmap.mmap(f.fileno(), 0, mmap.MAP_PRIVATE, REQUIRED_PROT)
+                self.mappings_mm[fn] = (mapped_filenames[fn], mm)
             for vma in vmas:
                 # we know it's not writeable (otherwise it would be in the coredump)
                 # so make it RX (FIXME look into sections?)
                 prot = uc.UC_PROT_READ | uc.UC_PROT_EXEC
                 assert vma.offset_end <= mmapsize(mm), \
-                    f'invalid mapping on {fname}: {vma}'
+                    f'invalid mapping on {fn}: {vma}'
                 ptr = ctypes.byref((ctypes.c_char*1).from_buffer(mm, vma.offset))
                 self.emu.mem_map_ptr(vma.start, vma.size, prot, ptr)
 
@@ -245,18 +252,56 @@ class EmuCore(object):
         if r_state != RtState.CONSISTENT.value:
             print('WARNING: coredump was taken when loaded objects list was in '
                 'an unconsistent state. will try to parse anyway...')
-        loaded_objects = list(RtLoadedObject.iterate(self.mem(), r_map))
+        self.loaded_objects = list(RtLoadedObject.iterate(self.mem(), r_map))
 
         # Actually load the symbols of each object
-        self.loaded_objects = { obj.addr:
-            self.__load_symbols_for(obj) for obj in loaded_objects }
+        self.symbols = defaultdict(lambda: [])
+        for obj in sorted(self.loaded_objects, key=lambda x: x.addr):
+            self.__load_symbols_for(obj)
+        self.symbols = dict(self.symbols)
 
-    def __load_symbols_for(obj: RtLoadedObject):
-        # Load dynamic symbols (this is guaranteed info, it doesn't depend
-        # on mappings / disk files at all, so start by loading these first)
-        return obj
+    def __load_symbols_for(self, obj: RtLoadedObject):
+        # Find mapped disk file, open it
+        if obj.addr != self.auxv.get(AuxvField.SYSINFO_EHDR.value):
+            fname, _ = self.get_mapping(obj.ld)
+            if fname not in self.mappings_mm:
+                print(f'WARNING: mappings for {fname} failed or were skipped, '
+                    'its symbols will not be loaded')
+                return
+            ofname, mm = self.mappings_mm[fname]
+            stream = BytesIO(mm)
+        else:
+            # VDSO is special bc kernel doesn't insert a mapping for it,
+            # but its pages are always dumped so we can read from memory
+            ofname, stream = b'[vdso]', self.mem(obj.addr)
+        
+        # Try to parse its symbols
+        try:
+            elf = elffile.ELFFile(stream)
+            for table in elf.iter_sections():
+                if not isinstance(table, sections.SymbolTableSection):
+                    continue
+                for sym in table.iter_symbols():
+                    self.symbols[sym.name].append((obj, sym.entry))
+            return obj
+        except Exception:
+            print(f'WARNING: failed to parse symbols from {ofname}, skipping')
+            return
+
+    def get_function_symbol(self, name: str) -> int:
+        '''Resolve the address of a function by looking at loaded symbols'''
+        syms = getattr(self, 'symbols', {}).get(name, [])
+        syms = [ sym for sym in syms if sym[1]['st_shndx'] != 'SHN_UNDEF'
+            and sym[1]['st_info']['type'] == 'STT_FUNC' ]
+        if not syms:
+            raise ValueError(f'no function symbol found for {repr(name)}')
+        # FIXME: prioritize global, then local, then weak. also maybe visibility
+        obj, sym = syms[0]
+        return obj.addr + sym['st_value']
+
 
     def __patch_libc(self):
+        if not hasattr(self, 'loaded_objects'): return
         pass # TODO
 
     def get_mapping(self, addr: int) -> FileMapping:
@@ -291,6 +336,7 @@ class EmuCore(object):
         emu = self.emu
         orig_stack = stack
         ret_addr = stack_base
+        func = self.get_function_symbol(func) if isinstance(func, str) else func
 
         # prepare stack, set registers
         assert len(stack) % 8 == 0
