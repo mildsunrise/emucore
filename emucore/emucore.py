@@ -51,6 +51,13 @@ class EmuCore(object):
     # WARNING: below properties will be absent if __load_symbols() failed
     loaded_objects: list[RtLoadedObject]
     symbols: dict[str, set[Symbol]]
+    symbols_by_type_by_addr: dict[
+        Symbol.Type,             # for each type...
+        tuple[
+            list[int],           # keys (addresses)
+            list[set[Symbol]],  # values (symbols at an address)
+        ]
+    ]
 
     emu_ctx: UcContext
 
@@ -262,7 +269,7 @@ class EmuCore(object):
             if ret_address != new_stack_addr:
                 raise Exception('stack reservations MUST be released in reverse order')
 
-    def get_mapping(self, addr: int) -> FileMapping:
+    def find_mapping(self, addr: int) -> FileMapping:
         idx = bisect.bisect(self.mappings__keys, addr)
         if idx > 0 and addr < self.mappings[idx-1][1].end:
             return self.mappings[idx-1]
@@ -283,7 +290,7 @@ class EmuCore(object):
         phdr_num = self.auxv[AuxvField.PHNUM.value]
         phdr = parse_program_header(self.core.structs, self.mem(phdr_base), phdr_num)
         # FIXME: use VMAs to locate base of executable, we'll need it to translate vaddrs, how tf does ld do it??
-        _, vma = self.get_mapping(phdr_base)
+        _, vma = self.find_mapping(phdr_base)
         main_base = vma.start - vma.offset
 
         # Find r_debug (debugger interface entry point) through the DT_DEBUG tag
@@ -316,14 +323,17 @@ class EmuCore(object):
 
         # Actually load the symbols of each object
         self.symbols = defaultdict(lambda: set())
+        by_addr = defaultdict(lambda: defaultdict(lambda: set()))
         for obj in sorted(self.loaded_objects, key=lambda x: x.addr):
-            self.__load_symbols_for(obj)
+            self.__load_symbols_for(obj, by_addr)
         self.symbols = dict(self.symbols)
+        self.symbols_by_type_by_addr = {
+            stype: list(zip(*sorted(addrs.items()))) for stype, addrs in by_addr.items() }
 
-    def __load_symbols_for(self, obj: RtLoadedObject):
+    def __load_symbols_for(self, obj: RtLoadedObject, by_addr: dict[Symbol.Type, dict[int, list[Symbol]]]):
         # Find mapped disk file, open it
         if obj.addr != self.auxv.get(AuxvField.SYSINFO_EHDR.value):
-            fname, _ = self.get_mapping(obj.ld)
+            fname, _ = self.find_mapping(obj.ld)
             if fname not in self.mappings_mm:
                 print(f'WARNING: mappings for {fname} failed or were skipped, '
                     'its symbols will not be loaded')
@@ -345,6 +355,7 @@ class EmuCore(object):
                     sym = Symbol.load(obj, sym)
                     if not sym.defined: continue
                     self.symbols[sym.name].add(sym)
+                    by_addr[sym.type][sym.addr].add(sym)
             return obj
         except Exception:
             print(f'WARNING: failed to parse symbols from {ofname}, skipping')
@@ -369,6 +380,21 @@ class EmuCore(object):
             raise ValueError(f'no matching symbol found for {repr(name)}')
         return syms[0].addr
 
+    def find_symbol(self, addr: int,
+        stype: Symbol.Type=Symbol.Type.FUNC, look_before: int=5,
+    ) -> dict:
+        '''Try to find a symbol that addr is in'''
+        assert not (stype is None)
+        keys, buckets = getattr(self, 'symbols_by_type_by_addr', {}).get(stype, ([], []))
+        idx = bisect.bisect(keys, addr)
+        within_size = lambda sym, pos: not sym.size or pos < sym.size
+        filter_syms = lambda baddr, syms: \
+            ( sym for sym in syms if within_size(sym, addr - baddr) )
+        syms = [ sym for n in range(min(look_before, idx))
+            for sym in filter_syms(keys[idx-1-n], buckets[idx-1-n]) ]
+        if syms: return syms[0]
+        raise ValueError(f'no {stype.name} symbol found at {addr:#x}')
+
     # PATCHES
 
     def __patch_libc(self):
@@ -378,15 +404,27 @@ class EmuCore(object):
     # EMULATION
 
     def format_code_addr(self, addr: int):
-        # for now, print its file + offset
-        # (FIXME: improve, show symbol if available)
         try:
-            fname, vma = self.get_mapping(addr)
+            # try to find symbol first
+            sym = self.find_symbol(addr)
         except ValueError:
-            return f'{addr:#x}'
-        fname = fname.decode(errors='replace')
-        offset = vma.offset + (addr - vma.start)
-        return f'{fname}[{offset:#x}]'
+            pass
+        else:
+            pos = addr - sym.addr
+            pos = f'[{pos:#x}]' if pos else ''
+            return f'{addr:#x} {sym.name}{pos}'
+
+        try:
+            # try mapping next
+            fname, vma = self.find_mapping(addr)
+        except ValueError:
+            pass
+        else:
+            fname = fname.decode(errors='replace')
+            offset = vma.offset + (addr - vma.start)
+            return f'{addr:#x} {fname}[{offset:#x}]'
+
+        return f'{addr:#x}'
 
     def format_exec_ctx(self):
         # FIXME: backtrace?
