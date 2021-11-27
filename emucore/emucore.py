@@ -19,7 +19,7 @@ from .utils import \
     sort_and_ensure_disjoint, VMA, \
     parse_load_segments, parse_file_note, Prstatus, FileMapping, \
     parse_auxv_note, AuxvField, \
-    parse_program_header, parse_dynamic_section, RtState, RtLoadedObject, \
+    parse_program_header, parse_dynamic_section, RtState, RtLoadedObject, Symbol, \
     mmapsize, elf_flags_to_uc_prot, SYSV_AMD_ARG_REGS
 
 from .syscall import SyscallX64
@@ -37,8 +37,6 @@ from .syscall import SyscallX64
 REQUIRED_PROT = mmap.PROT_READ | mmap.PROT_WRITE
 
 class EmuCore(object):
-    SymbolEntry = tuple[RtLoadedObject, dict]
-
     # open resources (FIXME: make this class a context manager)
     emu: Uc
     core: elffile.ELFFile
@@ -52,7 +50,7 @@ class EmuCore(object):
     auxv: dict[int, int]
     # WARNING: below properties will be absent if __load_symbols() failed
     loaded_objects: list[RtLoadedObject]
-    symbols: dict[str, list[SymbolEntry]]
+    symbols: dict[str, set[Symbol]]
 
     emu_ctx: UcContext
 
@@ -317,7 +315,7 @@ class EmuCore(object):
         self.loaded_objects = list(RtLoadedObject.iterate(self.mem(), r_map))
 
         # Actually load the symbols of each object
-        self.symbols = defaultdict(lambda: [])
+        self.symbols = defaultdict(lambda: set())
         for obj in sorted(self.loaded_objects, key=lambda x: x.addr):
             self.__load_symbols_for(obj)
         self.symbols = dict(self.symbols)
@@ -344,22 +342,32 @@ class EmuCore(object):
                 if not isinstance(table, sections.SymbolTableSection):
                     continue
                 for sym in table.iter_symbols():
-                    self.symbols[sym.name].append((obj, sym.entry))
+                    sym = Symbol.load(obj, sym)
+                    if not sym.defined: continue
+                    self.symbols[sym.name].add(sym)
             return obj
         except Exception:
             print(f'WARNING: failed to parse symbols from {ofname}, skipping')
             return
 
-    def get_function_symbol(self, name: str) -> int:
-        '''Resolve the address of a function by looking at loaded symbols'''
+    def get_symbols(self, name: str,
+        stype: Optional[Symbol.Type]=Symbol.Type.FUNC,
+        obj: Optional[RtLoadedObject]=None,
+        exposed_only: bool=False,
+    ) -> list[Symbol]:
         syms = getattr(self, 'symbols', {}).get(name, [])
-        syms = [ sym for sym in syms if sym[1]['st_shndx'] != 'SHN_UNDEF'
-            and sym[1]['st_info']['type'] == 'STT_FUNC' ]
-        if not syms:
-            raise ValueError(f'no function symbol found for {repr(name)}')
-        # FIXME: prioritize global, then local, then weak. also maybe visibility
-        obj, sym = syms[0]
-        return obj.addr + sym['st_value']
+        matches = lambda sym: \
+            (obj is None or obj == sym.obj) and \
+            (stype is None or stype == sym.type) and \
+            (not exposed_only or sym.is_exposed)
+        # FIXME: prioritize global, then weak, then local. also maybe visibility
+        return [ sym for sym in syms if matches(sym) ]
+
+    def get_symbol(self, name: str, *args, **kwargs) -> int:
+        '''Resolve the address of a symbol (fails if none found)'''
+        if not (syms := self.get_symbols(name, *args, **kwargs)):
+            raise ValueError(f'no matching symbol found for {repr(name)}')
+        return syms[0].addr
 
     # PATCHES
 
@@ -392,7 +400,7 @@ class EmuCore(object):
         instruction_limit: int = 10000, time_limit: int = 0,
     ) -> int:
         emu = self.emu
-        func = self.get_function_symbol(func) if isinstance(func, str) else func
+        func = self.get_symbol(func) if isinstance(func, str) else func
         ret_addr = self.stack_base
         emu.context_restore(self.emu_ctx)
 

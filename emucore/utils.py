@@ -11,6 +11,7 @@ import struct
 from typing import Any, BinaryIO, Callable, Iterator, NamedTuple, TypeVar, Union, Optional  
 from elftools.elf.elffile import ELFFile
 from elftools.elf.structs import ELFStructs
+from elftools.elf.sections import Symbol as ELFSymbol
 from elftools.elf.segments import Segment
 from unicorn.unicorn import uc, Uc, x86_const
 from elftools.elf.constants import P_FLAGS
@@ -18,6 +19,12 @@ from dataclasses import dataclass
 
 # get real size of mmap'ed region, i.e. rounding up by PAGESIZE
 mmapsize = lambda mm: ((mm.size() - 1) // mmap.PAGESIZE + 1) * mmap.PAGESIZE
+
+def try_enum(cls, x):
+    try:
+        return cls(x)
+    except ValueError:
+        return x
 
 # general serialization utilities
 
@@ -357,6 +364,90 @@ class RtLoadedObject(NamedTuple):
             l_name = bytes(read_bstr(st))
             yield RtLoadedObject(l_addr, l_name, l_ld)
             node = l_next
+
+# parse symbols
+
+class Symbol(NamedTuple):
+    class Type(enum.Enum):
+        '''Symbol type to look up. For a value not in the struct, specify it directly '''
+        NOTYPE = 'STT_NOTYPE'
+        OBJECT = 'STT_OBJECT'
+        FUNC = 'STT_FUNC'
+        SECTION = 'STT_SECTION'
+        FILE = 'STT_FILE'
+        COMMON = 'STT_COMMON'
+        TLS = 'STT_TLS'
+        NUM = 'STT_NUM'
+        RELC = 'STT_RELC'
+        SRELC = 'STT_SRELC'
+        # in the OS range...
+        IFUNC = 'STT_LOOS'
+
+    class Bind(enum.Enum):
+        LOCAL = 'STB_LOCAL'
+        GLOBAL = 'STB_GLOBAL'
+        WEAK = 'STB_WEAK'
+        NUM = 'STB_NUM'
+
+    class Visibility(enum.Enum):
+        DEFAULT = 'STV_DEFAULT'
+        INTERNAL = 'STV_INTERNAL'
+        HIDDEN = 'STV_HIDDEN'
+        PROTECTED = 'STV_PROTECTED'
+        EXPORTED = 'STV_EXPORTED'
+        SINGLETON = 'STV_SINGLETON'
+        ELIMINATE = 'STV_ELIMINATE'
+
+    obj: RtLoadedObject
+    name: str
+
+    size: Optional[int]
+    value: int
+
+    bind: Union[Bind, int, str]
+    type: Union[Type, int, str]
+    visibility: Union[Visibility, int, str]
+    shndx: Union[int, str]
+
+    # special types
+    @property
+    def is_function(self) -> bool:
+        return self.type == Symbol.Type.FUNC
+    @property
+    def is_callable(self) -> bool:
+        return self.type in {Symbol.Type.FUNC, Symbol.Type.IFUNC}
+
+    # special section indexes...
+    @property
+    def defined(self) -> bool:
+        return self.shndx != 'SHN_UNDEF'
+    @property
+    def is_abs(self) -> bool:
+        return self.shndx == 'SHN_ABS'
+    @property
+    def is_common(self) -> bool:
+        return self.shndx == 'SHN_COMMON'
+
+    # other useful computed properties
+    @property
+    def addr(self) -> int:
+        return self.obj.addr + self.value
+    @property
+    def is_exposed(self) -> bool:
+        return self.bind != Symbol.Bind.LOCAL and \
+            self.visibility in {Symbol.Visibility.DEFAULT, Symbol.Visibility.PROTECTED}
+
+    @staticmethod
+    def load(obj: RtLoadedObject, x: ELFSymbol) -> 'Symbol':
+        return Symbol(
+            obj, x.name,
+            x['st_size'] or None,
+            x['st_value'],
+            try_enum(Symbol.Bind, x['st_info']['bind']),
+            try_enum(Symbol.Type, x['st_info']['type']),
+            try_enum(Symbol.Visibility, x['st_other']['visibility']),
+            x['st_shndx'],
+        )
 
 # ABI-specific
 
