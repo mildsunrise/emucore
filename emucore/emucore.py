@@ -48,6 +48,7 @@ class EmuCore(object):
     # parsed info
     threads: list[Prstatus]
     mappings: list[FileMapping]
+    mappings__keys: list[int]    # start addresses
     auxv: dict[int, int]
     # WARNING: below properties will be absent if __load_symbols() failed
     loaded_objects: list[RtLoadedObject]
@@ -80,6 +81,7 @@ class EmuCore(object):
         file_note = next(n['n_desc'] for n in notes if n['n_type'] == 'NT_FILE')
         self.mappings = sort_and_ensure_disjoint(
             parse_file_note(file_note), lambda x: x[1])
+        self.mappings__keys = [ vma.start for _, vma in self.mappings ]
         # threads
         self.threads = list(map(Prstatus.load,
             filter(lambda n: n['n_type'] == 'NT_PRSTATUS', notes)))
@@ -263,7 +265,7 @@ class EmuCore(object):
                 raise Exception('stack reservations MUST be released in reverse order')
 
     def get_mapping(self, addr: int) -> FileMapping:
-        idx = bisect.bisect([ x[1].start for x in self.mappings ], addr)
+        idx = bisect.bisect(self.mappings__keys, addr)
         if idx > 0 and addr < self.mappings[idx-1][1].end:
             return self.mappings[idx-1]
         raise ValueError(f'address {addr:#x} not mapped')
