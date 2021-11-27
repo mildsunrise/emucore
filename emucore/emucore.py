@@ -7,7 +7,7 @@ import ctypes
 from io import DEFAULT_BUFFER_SIZE, BufferedRandom, BytesIO
 import os
 from typing import Callable, Optional, Union
-from unicorn.unicorn import Uc, UcError, uc, x86_const
+from unicorn.unicorn import Uc, UcContext, UcError, uc, x86_const
 from elftools.elf import elffile, sections
 import mmap
 import struct
@@ -51,6 +51,8 @@ class EmuCore(object):
     loaded_objects: list[RtLoadedObject]
     symbols: dict[str, list[SymbolEntry]]
 
+    emu_ctx: UcContext
+
     # stack management
     stack_base: int
     stack_size: int
@@ -90,6 +92,8 @@ class EmuCore(object):
         # stores TCB in FS, any TLS-related stuff will fail if not initialized)
         for reg in {x86_const.UC_X86_REG_FS_BASE, x86_const.UC_X86_REG_GS_BASE}:
             self.emu.reg_write(reg, self.threads[0].regs[reg])
+        # save clean context
+        self.emu_ctx = self.emu.context_save()
 
         # Map everything into emulator
         print('Mapping memory...')
@@ -386,6 +390,7 @@ class EmuCore(object):
         emu = self.emu
         func = self.get_function_symbol(func) if isinstance(func, str) else func
         ret_addr = self.stack_base
+        emu.context_restore(self.emu_ctx)
 
         # set up arguments
         assert all(isinstance(x, int) for x in args), \
