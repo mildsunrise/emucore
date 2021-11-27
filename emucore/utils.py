@@ -360,7 +360,7 @@ class RtLoadedObject(NamedTuple):
 
 # ABI-specific
 
-SYSV_AMD_PARAM_REGS = [
+SYSV_AMD_ARG_REGS = [
     x86_const.UC_X86_REG_RDI,
     x86_const.UC_X86_REG_RSI,
     x86_const.UC_X86_REG_RDX,

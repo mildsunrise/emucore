@@ -12,6 +12,7 @@ from elftools.elf import elffile, sections
 import mmap
 import struct
 import bisect
+from contextlib import contextmanager
 
 from .utils import \
     UnicornIO, read_struct, write_struct, read_bstr, read_str, write_str, \
@@ -19,7 +20,7 @@ from .utils import \
     parse_load_segments, parse_file_note, Prstatus, FileMapping, \
     parse_auxv_note, AuxvField, \
     parse_program_header, parse_dynamic_section, RtState, RtLoadedObject, \
-    mmapsize, elf_flags_to_uc_prot, SYSV_AMD_PARAM_REGS
+    mmapsize, elf_flags_to_uc_prot, SYSV_AMD_ARG_REGS
 
 # FIXME: a lot of these asserts should be exceptions, we should have a class
 # FIXME: proper log system
@@ -50,9 +51,15 @@ class EmuCore(object):
     loaded_objects: list[RtLoadedObject]
     symbols: dict[str, list[SymbolEntry]]
 
+    # stack management
+    stack_base: int
+    stack_size: int
+    stack_addr: int
+
     def __init__(
         self, filename: str,
         patch_libc: bool=True, mapping_load_kwargs={},
+        stack_addr: int = 0x7f10000000000000, stack_size: int = 16 * 1024 * 1024,
     ):
         # Start by opening the core file
         self.core = elffile.ELFFile(open(filename, 'rb'))
@@ -99,6 +106,13 @@ class EmuCore(object):
         # Post-load fixups
         if patch_libc:
             self.__patch_libc()
+
+        # Map our stack area
+        self.stack_addr, self.stack_size = stack_addr, stack_size
+        self.stack_base = stack_addr - stack_size
+        self.emu.mem_map(self.stack_base, self.stack_size, uc.UC_PROT_ALL)
+
+    # MEMORY MAPPING
 
     def __load_core_segments(self):
         '''Read LOAD segments from core and map them'''
@@ -210,6 +224,46 @@ class EmuCore(object):
         stream.write_str = lambda *args, **kwargs: write_str(stream, *args, **kwargs)
         return stream
 
+    @contextmanager
+    def reserve(self, size: int, align=8):
+        '''Returns a context manager object that allocates memory on our stack area.
+
+        The `align` parameter (default: 8) skips memory before the allocation so
+        that its *start* ends up aligned to it.
+
+        Note that these allocations take space from the stack area, i.e.
+        functions will have less available space to run. For big allocations
+        you may even run out of space in the stack yourself; the area can be
+        enlarged through the `stack_size` parameter in the constructor.
+
+        If you don't use the `with` statement, make sure that reservations
+        are released in REVERSE ORDER, anything else will raise.
+
+        The address of the allocated area can be get through the `start` attribute.
+        '''
+        if not size:
+            return self.mem(self.stack_addr, 0)
+        old_stack_addr = self.stack_addr
+        new_stack_addr = self.stack_addr - size
+        new_stack_addr -= new_stack_addr % align
+        try:
+            self.stack_addr = new_stack_addr
+            assert self.stack_base <= new_stack_addr
+            yield self.mem(self.stack_addr, size)
+        finally:
+            ret_address = self.stack_addr
+            self.stack_addr = max(old_stack_addr, self.stack_addr)
+            if ret_address != new_stack_addr:
+                raise Exception('stack reservations MUST be released in reverse order')
+
+    def get_mapping(self, addr: int) -> FileMapping:
+        idx = bisect.bisect([ x[1].start for x in self.mappings ], addr)
+        if idx > 0 and addr < self.mappings[idx-1][1].end:
+            return self.mappings[idx-1]
+        raise ValueError(f'address {addr:#x} not mapped')
+
+    # SYMBOLS
+
     def __load_symbols(self):
         '''Find info about loaded objects and load their symbols'''
         # First we need to parse the binary ELF. This is essential;
@@ -299,16 +353,13 @@ class EmuCore(object):
         obj, sym = syms[0]
         return obj.addr + sym['st_value']
 
+    # PATCHES
 
     def __patch_libc(self):
         if not hasattr(self, 'loaded_objects'): return
         pass # TODO
 
-    def get_mapping(self, addr: int) -> FileMapping:
-        idx = bisect.bisect([ x[1].start for x in self.mappings ], addr)
-        if idx > 0 and addr < self.mappings[idx-1][1].end:
-            return self.mappings[idx-1]
-        raise ValueError(f'address {addr:#x} not mapped')
+    # EMULATION
 
     def format_code_addr(self, addr: int):
         # for now, print its file + offset
@@ -328,63 +379,57 @@ class EmuCore(object):
         return f'ip={ip} sp={sp:#x}'
 
     # FIXME: implement more archs and calling conventions
-    def call(self, func: int, *params: tuple[int], stack: bytearray=bytearray(),
-        stack_base: int = 0x7ffffffff0000000,
-        # resources
-        stack_size: int = 1024 * 1024, instruction_limit: int = 10000, time_limit: int = 0,
+    def call(
+        self, func: Union[int, str], *args: int,
+        instruction_limit: int = 10000, time_limit: int = 0,
     ) -> int:
         emu = self.emu
-        orig_stack = stack
-        ret_addr = stack_base
         func = self.get_function_symbol(func) if isinstance(func, str) else func
+        ret_addr = self.stack_base
 
-        # prepare stack, set registers
-        assert len(stack) % 8 == 0
-        assert all(isinstance(x, int) for x in params), 'float arguments not implemented yet'
-        param_regs = SYSV_AMD_PARAM_REGS
-        for p, reg in zip(params, param_regs):
-            emu.reg_write(reg, p)
-        stack_params = params[len(param_regs):] # TODO: pass stack params
-        # TODO: align to 16-bytes + 8 (now or before params?)
-        stack = struct.pack('<Q', ret_addr) + bytes(stack)
+        # set up arguments
+        assert all(isinstance(x, int) for x in args), \
+            'float and other non-integer arguments not implemented yet'
+        assert all(-(1 << 63) <= x < (1 << 64) for x in args), \
+            'arguments must be in u64 or s64 range (128 ints not implemented yet)'
+        args = [ x & ~((~0) << 64) for x in args ]
+        arg_regs = SYSV_AMD_ARG_REGS
+        for p, reg in zip(args, arg_regs): emu.reg_write(reg, p)
+        stack_args = args[len(arg_regs):]
 
-        # map stack area
-        PAGESIZE = emu.query(uc.UC_QUERY_PAGE_SIZE)
-        assert stack_base % PAGESIZE == 0
-        stack_size += len(stack)
-        stack_size = ((stack_size - 1) // PAGESIZE + 1) * PAGESIZE
-        emu.mem_map(stack_base, stack_size, uc.UC_PROT_ALL)
-        stack_entry = stack_base + stack_size - len(stack)
-        emu.mem_write(stack_entry, stack)
+        # finish stack (pad if necessary so that arguments end up on a multiple of 16)
+        # (FIXME take advantage if current stack_addr % 16 < 8)
+        if len(stack_args) % 1: stack_args.append(0)
+        stack_args.insert(0, ret_addr)
+        stack_args = struct.pack(f'<{len(stack_args)}Q', *stack_args)
 
-        # register hooks
-        hooks = []
+        # define hooks
         syscall = None
         def hook_intr(_self, intno: int, _):
             nonlocal syscall
             syscall = intno
             emu.emu_stop()
-        hooks.append(emu.hook_add(uc.UC_HOOK_INTR, hook_intr))
         def hook_mem(_self, htype: int, address: int, size: int, value: int, _):
             # FIXME: check if unmapped or skipped mapping, raise as error
             print(f'mem: {htype} addr={address:#x} size={size} value={value}')
-        hooks.append(emu.hook_add(uc.UC_HOOK_MEM_INVALID, hook_mem))
+        hooks = [ (uc.UC_HOOK_INTR, hook_intr), (uc.UC_HOOK_MEM_INVALID, hook_mem) ]
 
         # emulate!
-        emu.reg_write(x86_const.UC_X86_REG_RSP, stack_entry)
-        try:
-            emu.emu_start(func, ret_addr, time_limit, instruction_limit)
-        except UcError as e:
-            raise Exception(f'Unknown Unicorn error ({self.format_exec_ctx()})') from e
-        finally:
-            # collect result, clean up
-            for hook in hooks: emu.hook_del(hook)
-            orig_stack[:] = emu.mem_read(stack_base, len(orig_stack))
-            emu.mem_unmap(stack_base, stack_size)
-        if emu.reg_read(x86_const.UC_X86_REG_RIP) != ret_addr:
-            raise Exception(f'Limits exhausted ({self.format_exec_ctx()})')
-        assert emu.reg_read(x86_const.UC_X86_REG_RSP) == stack_entry + 8
-        return emu.reg_read(x86_const.UC_X86_REG_RAX)
+        with self.reserve(len(stack_args), align=16) as mem:
+            mem.write(stack_args)
+            emu.reg_write(x86_const.UC_X86_REG_RSP, mem.start)
+            try:
+                hook_handles = []
+                for hook in hooks: hook_handles.append(emu.hook_add(*hook))
+                emu.emu_start(func, ret_addr, time_limit, instruction_limit)
+            except UcError as e:
+                raise Exception(f'Unknown Unicorn error ({self.format_exec_ctx()})') from e
+            finally:
+                for hook in hook_handles: emu.hook_del(hook)
+            if emu.reg_read(x86_const.UC_X86_REG_RIP) != ret_addr:
+                raise Exception(f'Limits exhausted ({self.format_exec_ctx()})')
+            assert emu.reg_read(x86_const.UC_X86_REG_RSP) == mem.start + 8
+            return emu.reg_read(x86_const.UC_X86_REG_RAX)
 
 
 # stop reasons:
