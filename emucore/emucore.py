@@ -22,6 +22,8 @@ from .utils import \
     parse_program_header, parse_dynamic_section, RtState, RtLoadedObject, \
     mmapsize, elf_flags_to_uc_prot, SYSV_AMD_ARG_REGS
 
+from .syscall import SyscallX64
+
 # FIXME: a lot of these asserts should be exceptions, we should have a class
 # FIXME: proper log system
 
@@ -409,15 +411,22 @@ class EmuCore(object):
         stack_args = struct.pack(f'<{len(stack_args)}Q', *stack_args)
 
         # define hooks
-        syscall = None
-        def hook_intr(_self, intno: int, _):
-            nonlocal syscall
-            syscall = intno
-            emu.emu_stop()
+        def hook_intr(intno: Union[int, str]):
+            try:
+                nr = SyscallX64(emu.reg_read(x86_const.UC_X86_REG_RAX))
+            except ValueError as e:
+                raise Exception(f'invalid syscall ({intno})') from e
+            else:
+                raise Exception(f'code attempted {nr.name} syscall ({intno})')
         def hook_mem(_self, htype: int, address: int, size: int, value: int, _):
             # FIXME: check if unmapped or skipped mapping, raise as error
             print(f'mem: {htype} addr={address:#x} size={size} value={value}')
-        hooks = [ (uc.UC_HOOK_INTR, hook_intr), (uc.UC_HOOK_MEM_INVALID, hook_mem) ]
+        hooks = [
+            *((uc.UC_HOOK_INSN, (lambda k: lambda _self, _: hook_intr(k))(kind), None, 1, 0, ins) for ins, kind in
+                [(x86_const.UC_X86_INS_SYSCALL, 'syscall'), (x86_const.UC_X86_INS_SYSENTER, 'sysenter')]),
+            (uc.UC_HOOK_INTR, lambda _self, no, _: hook_intr(no)),
+            (uc.UC_HOOK_MEM_INVALID, hook_mem),
+        ]
 
         # emulate!
         with self.reserve(len(stack_args), align=16) as mem:
