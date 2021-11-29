@@ -107,6 +107,7 @@ class EmuCore(object):
         self, filename: str,
         patch_glibc: bool=True, patch_lock: bool=False, mapping_load_kwargs={},
         stack_addr: int = 0x7f10000000000000, stack_size: int = 16 * 1024 * 1024,
+        trace_stack: bool = True,
     ):
         '''Parses the corefile, loads the referenced files, and initializes a
         Unicorn emulator instance mapped with its memory.
@@ -131,6 +132,10 @@ class EmuCore(object):
           - `stack_addr`, `stack_size`: location and size of our custom stack area,
             used by `call()` and `reserve()` to emulate calls. By default a 16MiB
             stack is used, in some cases you may need a bigger size.
+        
+          - `trace_stack`: trace stack pointer at basic block boundary to be able to
+            reconstruct a sort of call stack (default: True, you may want to disable it
+            for performance)
         '''
         # Start by opening the core file
         self.core = elffile.ELFFile(open(filename, 'rb'))
@@ -172,6 +177,9 @@ class EmuCore(object):
             (uc.UC_HOOK_INSN, lambda: self.__hook_intr('syscall'), x86_const.UC_X86_INS_SYSCALL),
             (uc.UC_HOOK_INSN, lambda: self.__hook_intr('sysenter'), x86_const.UC_X86_INS_SYSENTER),
         ]
+        self.trace_stack = trace_stack
+        if trace_stack:
+            hooks.append((uc.UC_HOOK_BLOCK, self.__hook_block))
         for hook, cb, *args in hooks:
             self.emu.hook_add(hook, (lambda cb: lambda *args: cb(*args[1:-1]))(cb), None, 1, 0, *args)
 
@@ -594,13 +602,15 @@ class EmuCore(object):
     def format_exec_ctx(self):
         '''Collect info about the current execution context and return it
         as formatted text. Used for errors.'''
-        # FIXME: backtrace?
-        ip = self.format_code_addr(self.emu.reg_read(x86_const.UC_X86_REG_RIP))
-        sp = self.emu.reg_read(x86_const.UC_X86_REG_RSP)
-        return f'at {ip}, sp={sp:#x}'
+        trace = getattr(self, 'stacktrace', []) + [(
+            self.emu.reg_read(x86_const.UC_X86_REG_RSP),
+            self.emu.reg_read(x86_const.UC_X86_REG_RIP),
+        )]
+        format_call = lambda sp, ip: f'  at {self.format_code_addr(ip)}, sp={sp:#x}'
+        return '\n'.join(format_call(*c) for c in trace)
 
     def __emulation_error(self, msg: str):
-        return EmulationError(f'{msg}\n[{self.format_exec_ctx()}]')
+        return EmulationError(f'{msg}\n{self.format_exec_ctx()}')
 
     def __hook_mem(self, htype: int, addr: int, size: int, value: int):
         access_type, cause = UC_MEM_TYPES[htype]
@@ -628,6 +638,14 @@ class EmuCore(object):
             raise self.__emulation_error(f'invalid syscall {nr} ({intno})') from None
         raise self.__emulation_error(f'"{nr.name}" syscall ({intno})')
 
+    trace_stack: bool
+    stacktrace: list[tuple[int, int]]
+
+    def __hook_block(self, addr, size):
+        stacktrace = self.stacktrace
+        sp = self.emu.reg_read(x86_const.UC_X86_REG_RSP)
+        while stacktrace and stacktrace[-1][0] <= sp: stacktrace.pop()
+        stacktrace.append((sp, addr + size))
     # FIXME: implement more archs and calling conventions
     def call(
         self, func: Union[int, str], *args: int,
@@ -651,6 +669,7 @@ class EmuCore(object):
         func = self.get_symbol(func) if isinstance(func, str) else func
         ret_addr = self.stack_base
         emu.context_restore(self.emu_ctx)
+        if self.trace_stack: self.stacktrace = []
 
         # set up arguments
         assert all(isinstance(x, int) for x in args), \
