@@ -66,13 +66,14 @@ If we were to use `get_font_description` a lot of times, we should also free the
 
 ## Wishlist
 
+ - Float function arguments
  - Better errors, backtraces
  - Use debug info if available (for errors, interface)
  - More archs / OSes
  - Support for `sbrk` (so that `malloc` can always work)
  - C++ support
- - Configurable logging
  - Make sure it works in Python 3.8 and lower
+ - Support for calling IFUNCs directly
 
 
 

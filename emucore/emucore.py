@@ -2,6 +2,7 @@
 Main module, exposes public API
 """
 
+import logging
 from collections import defaultdict
 import ctypes
 from io import DEFAULT_BUFFER_SIZE, BufferedRandom, BytesIO
@@ -23,6 +24,8 @@ from .utils import \
     mmapsize, elf_flags_to_uc_prot, SYSV_AMD_ARG_REGS
 
 from .syscall import SyscallX64
+
+logger = logging.getLogger(__name__)
 
 # FIXME: a lot of these asserts should be exceptions, we should have a class
 # FIXME: proper log system
@@ -105,18 +108,19 @@ class EmuCore(object):
         self.emu_ctx = self.emu.context_save()
 
         # Map everything into emulator
-        print('Mapping memory...')
-        if self.auxv[AuxvField.PAGESZ.value] != mmap.PAGESIZE:
-            print('WARNING: page size should match with the host')
+        if (pagesize := self.auxv[AuxvField.PAGESZ.value]) != mmap.PAGESIZE:
+            logger.warn(f'coredump page size ({pagesize}) differs from host ({mmap.PAGESIZE})')
         assert self.emu.query(uc.UC_QUERY_PAGE_SIZE) <= mmap.PAGESIZE
         # (first core segments, then RO mappings over any uncovered areas)
         self.__load_core_segments()
         self.__load_mappings(**mapping_load_kwargs)
 
         # Load symbols from binary and loaded objects
+        logger.info('Loading symbols...')
         self.__load_symbols()
 
         # Post-load fixups
+        logger.info('Performing fixups...')
         if patch_libc:
             self.__patch_libc()
 
@@ -130,7 +134,7 @@ class EmuCore(object):
     def __load_core_segments(self):
         '''Read LOAD segments from core and map them'''
         load_segs = parse_load_segments(self.core)
-        print(f'Mapping {len(load_segs)} LOAD segments...')
+        logger.info(f'Mapping {len(load_segs)} LOAD segments...')
         corefd = self.core.stream.fileno()
         self.core_mm = mm = mmap.mmap(corefd, 0, mmap.MAP_PRIVATE, REQUIRED_PROT)
         for vma, flags in load_segs:
@@ -191,17 +195,20 @@ class EmuCore(object):
             (fn := filename_map(fn)) != None and os.path.exists(fn) and not os.path.isfile(fn)
         file_skipped = lambda fn: \
             (skip_invalid and is_invalid(fn)) or (skip_special and is_special(fn)) \
-            or any(pref.startswith(fn) for pref in blacklist)
+            or any(fn.startswith(pref) for pref in blacklist)
         file_filter = lambda fn: \
-            any(pref.startswith(fn) for pref in whitelist) or not file_skipped(fn)
+            any(fn.startswith(pref) for pref in whitelist) or not file_skipped(fn)
         mapped_filenames = { fn: fn2 for fn in file_mappings
             if file_filter(fn) and (fn2 := filename_map(fn)) != None }
-        print('Skipped files with VMAs:\n{}'.format('\n'.join(
-            f' - {fn.decode(errors="replace")}'
-                for fn, vmas in file_mappings.items() if fn not in mapped_filenames and vmas )))
+
+        skipped_with_vmas = [ fn for fn, vmas in file_mappings.items()
+            if fn not in mapped_filenames and vmas ]
+        if skipped_with_vmas:
+            logger.info('Skipped files with VMAs:\n{}'.format('\n'.join(
+                f' - {fn.decode(errors="replace")}' for fn in skipped_with_vmas )))
         file_mappings = { fn: v for fn, v in file_mappings.items() if fn in mapped_filenames }
         total_mappings = sum(len(v) for v in file_mappings.values())
-        print(f'Mapping {len(file_mappings)} files, {total_mappings} VMAs...')
+        logger.info(f'Mapping {len(file_mappings)} files, {total_mappings} VMAs...')
 
         # map files (FIXME: catch open() errors and move on)
         self.mappings_mm = {}
@@ -218,14 +225,21 @@ class EmuCore(object):
                 ptr = ctypes.byref((ctypes.c_char*1).from_buffer(mm, vma.offset))
                 self.emu.mem_map_ptr(vma.start, vma.size, prot, ptr)
 
-    def mem(self, start: int=0, size: Optional[int]=None, offset: int=0, buffer_size: int=DEFAULT_BUFFER_SIZE):
+    def mem(self, start: Union[int, str]=0, size: Optional[int]=None, offset: int=0, buffer_size: int=DEFAULT_BUFFER_SIZE):
         '''Returns a binary I/O stream over (a region of) memory
 
         First two arguments restrict the accessible memory range,
         with `start` being exposed at offset 0.
 
         The `offset` parameter calls seek() on the returned stream.
+
+        If `start` is a string, it will be resolved as an OBJECT symbol.
+        If you need more control, call `get_symbol()` directly.
         '''
+        if isinstance(start, str):
+            if not (syms := self.get_symbols(start, stype=Symbol.Type.OBJECT)):
+                raise ValueError(f'no OBJECT symbol found for {start}')
+            start, size = syms[0].addr, syms[0].size
         stream = UnicornIO(self.emu, start, size, offset)
         # FIXME: BufferedRandom fails with some obscure exception from native code...
         #stream = BufferedRandom(stream, buffer_size) if buffer_size > 0 else stream
@@ -299,7 +313,7 @@ class EmuCore(object):
             dt_debug = next(parse_dynamic_section(self.core.structs,
                 self.mem(main_base + dyn_seg), 'DT_DEBUG'))['d_ptr']
         except StopIteration:
-            print('WARNING: cannot find DT_DEBUG tag in binary. either it is a '
+            logger.warn('cannot find DT_DEBUG tag in binary. either it is a '
                 'statically linked executable or it does not conform to the debugger '
                 'interface, in which case info about shared libraries will be lost')
             # FIXME: for statically-linked executables, verify that they really don't
@@ -307,17 +321,17 @@ class EmuCore(object):
             # by looking through the sections instead of the dynamic segment
             return
         if not dt_debug:
-            print('WARNING: DT_DEBUG tag not initialized. either linker does not '
+            logger.warn('DT_DEBUG tag not initialized. either linker does not '
                 'follow debugger interface or who knows')
             return
 
         # Parse debug interface data
         r_version, r_map, r_brk, r_state, r_ldbase = self.mem(dt_debug).read_struct('<i4xQQi4xQ')
         if r_version != 1:
-            print(f'WARNING: unexpected/unsupported debugger interface version {r_version}. '
+            logger.warn(f'unexpected/unsupported debugger interface version {r_version}. '
                 'will try to parse anyway...')
         if r_state != RtState.CONSISTENT.value:
-            print('WARNING: coredump was taken when loaded objects list was in '
+            logger.warn('coredump was taken when loaded objects list was in '
                 'an unconsistent state. will try to parse anyway...')
         self.loaded_objects = list(RtLoadedObject.iterate(self.mem(), r_map))
 
@@ -335,7 +349,7 @@ class EmuCore(object):
         if obj.addr != self.auxv.get(AuxvField.SYSINFO_EHDR.value):
             fname, _ = self.find_mapping(obj.ld)
             if fname not in self.mappings_mm:
-                print(f'WARNING: mappings for {fname} failed or were skipped, '
+                logger.warn(f'mappings for {fname} failed or were skipped, '
                     'its symbols will not be loaded')
                 return
             ofname, mm = self.mappings_mm[fname]
@@ -358,7 +372,7 @@ class EmuCore(object):
                     by_addr[sym.type][sym.addr].add(sym)
             return obj
         except Exception:
-            print(f'WARNING: failed to parse symbols from {ofname}, skipping')
+            logger.warn(f'failed to parse symbols from {ofname}, skipping')
             return
 
     def get_symbols(self, name: str,
@@ -412,7 +426,9 @@ class EmuCore(object):
         else:
             pos = addr - sym.addr
             pos = f'[{pos:#x}]' if pos else ''
-            return f'{addr:#x} {sym.name}{pos}'
+            fname = sym.obj.name.decode(errors='ignore')
+            offset = addr - sym.obj.addr
+            return f'{addr:#x} {sym.name}{pos} ({fname}[{offset:#x}])'
 
         try:
             # try mapping next
@@ -422,7 +438,7 @@ class EmuCore(object):
         else:
             fname = fname.decode(errors='replace')
             offset = vma.offset + (addr - vma.start)
-            return f'{addr:#x} {fname}[{offset:#x}]'
+            return f'{addr:#x} ({fname}[{offset:#x}])'
 
         return f'{addr:#x}'
 
@@ -435,7 +451,7 @@ class EmuCore(object):
     # FIXME: implement more archs and calling conventions
     def call(
         self, func: Union[int, str], *args: int,
-        instruction_limit: int = 10000, time_limit: int = 0,
+        instruction_limit: int = 10000000, time_limit: int = 0,
     ) -> int:
         emu = self.emu
         func = self.get_symbol(func) if isinstance(func, str) else func
@@ -489,7 +505,7 @@ class EmuCore(object):
             finally:
                 for hook in hook_handles: emu.hook_del(hook)
             if emu.reg_read(x86_const.UC_X86_REG_RIP) != ret_addr:
-                raise Exception(f'Limits exhausted ({self.format_exec_ctx()})')
+                raise Exception(f'Instruction/time limit exhausted ({self.format_exec_ctx()})')
             assert emu.reg_read(x86_const.UC_X86_REG_RSP) == mem.start + 8
             return emu.reg_read(x86_const.UC_X86_REG_RAX)
 

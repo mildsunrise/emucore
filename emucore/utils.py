@@ -36,7 +36,7 @@ def write_struct(st: BinaryIO, fmt: Union[str, struct.Struct], *v: Any):
     desc = struct.pack(fmt, *v) if isinstance(fmt, str) else fmt.pack(*v)
     return st.write(desc)
 
-def read_bstr(st: BinaryIO, allow_trunc: bool=False, max_size: Optional[int]=1024*1024) -> bytearray:
+def read_bstr(st: BinaryIO, allow_trunc: bool=False, max_size: Optional[int]=16*1024*1024) -> bytearray:
     res = bytearray()
     while (max_size is None or len(res) < max_size) and (car := st.read(1)):
         if not car[0]: return res
@@ -171,19 +171,24 @@ class VMA(NamedTuple):
 
 def parse_load_segments(elf: ELFFile) -> list[tuple[VMA, int]]:
     '''Parses the LOAD segments of an ELFFile into a list of (vma, flags) tuples'''
-    return [ parse_load_segment(seg) for seg in elf.iter_segments() if seg['p_type'] == 'PT_LOAD' ]
+    return [ parsed for seg in elf.iter_segments()
+        if seg['p_type'] == 'PT_LOAD' and (parsed := parse_load_segment(seg))[0].size ]
 
 def parse_load_segment(seg: Segment):
     '''See parse_load_segments'''
-    assert seg['p_filesz'] == seg['p_memsz']
-    return VMA(seg['p_vaddr'], seg['p_vaddr'] + seg['p_filesz'], seg['p_offset']), seg['p_flags']
+    # Kernel (but not gcore) sets memsz to the full extent of the mapping,
+    # and filesz to the initial fraction that was dumped to the corefile
+    assert seg['p_memsz'] > 0 and seg['p_filesz'] <= seg['p_memsz']
+    vma = VMA(seg['p_vaddr'], seg['p_vaddr'] + seg['p_filesz'], seg['p_offset'])
+    return vma, seg['p_flags']
 
 FileMapping = tuple[bytes, VMA]
 
 def parse_file_note(note) -> list[FileMapping]:
     '''Parses the LOAD segments of an ELFFile into a list of (filename, vma) tuples'''
-    assert note['page_size'] == 1
-    parse_vma = lambda vma: VMA(vma['vm_start'], vma['vm_end'], vma['page_offset'])
+    assert note['page_size'] > 0
+    parse_vma = lambda vma: \
+        VMA(vma['vm_start'], vma['vm_end'], vma['page_offset'] * note['page_size'])
     mappings = map(parse_vma, note['Elf_Nt_File_Entry'])
     mappings = list(zip(note['filename'], mappings))
     assert note['num_map_entries'] == len(mappings)

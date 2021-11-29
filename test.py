@@ -1,3 +1,6 @@
+import logging
+logging.basicConfig(level=logging.INFO)
+
 from emucore import EmuCore
 
 # opens core file, opens referenced files,
