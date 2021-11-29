@@ -7,7 +7,7 @@ from collections import defaultdict
 import ctypes
 from io import DEFAULT_BUFFER_SIZE, BufferedRandom, BytesIO
 import os
-from typing import Callable, Optional, Union
+from typing import Callable, Literal, Optional, Union
 from unicorn.unicorn import Uc, UcContext, UcError, uc, x86_const
 from elftools.elf import elffile, sections
 import mmap
@@ -21,9 +21,11 @@ from .utils import \
     parse_load_segments, parse_file_note, Prstatus, FileMapping, \
     parse_auxv_note, AuxvField, \
     parse_program_header, parse_dynamic_section, RtState, RtLoadedObject, Symbol, \
-    mmapsize, elf_flags_to_uc_prot, SYSV_AMD_ARG_REGS
+    mmapsize, elf_flags_to_uc_prot, SYSV_AMD_ARG_REGS, UC_MEM_TYPES
 
 from .syscall import SyscallX64
+
+__all__ = ['EmuCore', 'EmulationError']
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +40,9 @@ logger = logging.getLogger(__name__)
 
 # minimum access required by Unicorn on mapped areas, otherwise behaviour is undefined
 REQUIRED_PROT = mmap.PROT_READ | mmap.PROT_WRITE
+
+class EmulationError(Exception):
+    pass
 
 class EmuCore(object):
     '''Emulator for core dumps.
@@ -151,6 +156,16 @@ class EmuCore(object):
             self.emu.reg_write(reg, self.threads[0].regs[reg])
         # save clean context
         self.emu_ctx = self.emu.context_save()
+        # register hooks
+        hooks = [
+            (uc.UC_HOOK_MEM_INVALID, self.__hook_mem),
+            (uc.UC_HOOK_INSN_INVALID, self.__hook_insn_invalid),
+            (uc.UC_HOOK_INTR, self.__hook_intr),
+            (uc.UC_HOOK_INSN, lambda: self.__hook_intr('syscall'), x86_const.UC_X86_INS_SYSCALL),
+            (uc.UC_HOOK_INSN, lambda: self.__hook_intr('sysenter'), x86_const.UC_X86_INS_SYSENTER),
+        ]
+        for hook, cb, *args in hooks:
+            self.emu.hook_add(hook, (lambda cb: lambda *args: cb(*args[1:-1]))(cb), None, 1, 0, *args)
 
         # Map everything into emulator
         if (pagesize := self.auxv[AuxvField.PAGESZ.value]) != mmap.PAGESIZE:
@@ -496,7 +511,36 @@ class EmuCore(object):
         # FIXME: backtrace?
         ip = self.format_code_addr(self.emu.reg_read(x86_const.UC_X86_REG_RIP))
         sp = self.emu.reg_read(x86_const.UC_X86_REG_RSP)
-        return f'ip={ip} sp={sp:#x}'
+        return f'at {ip}, sp={sp:#x}'
+
+    def __emulation_error(self, msg: str):
+        return EmulationError(f'{msg}\n[{self.format_exec_ctx()}]')
+
+    def __hook_mem(self, htype: int, addr: int, size: int, value: int):
+        access_type, cause = UC_MEM_TYPES[htype]
+        faddr = self.format_code_addr(addr)
+        text = f'{access_type.lower()} of {size} bytes at {faddr}'
+        if cause == 'PROT':
+            raise self.__emulation_error(f'{text}, which is protected')
+        if cause == 'UNMAPPED':
+            try:
+                fname, vma = self.find_mapping(addr)
+            except ValueError:
+                raise self.__emulation_error(f'{text}, which is invalid') from None
+            assert fname not in self.mappings_mm
+            raise self.__emulation_error(
+                f'{text}, which belongs to a file that was skipped or failed to load')
+
+    def __hook_insn_invalid(self):
+        raise self.__emulation_error('invalid instruction')
+
+    def __hook_intr(self, intno: Union[int, Literal['syscall', 'sysenter']]):
+        nr = self.emu.reg_read(x86_const.UC_X86_REG_RAX)
+        try:
+            nr = SyscallX64(nr)
+        except ValueError as e:
+            raise self.__emulation_error(f'invalid syscall {nr} ({intno})') from None
+        raise self.__emulation_error(f'"{nr.name}" syscall ({intno})')
 
     # FIXME: implement more archs and calling conventions
     def call(
@@ -538,44 +582,12 @@ class EmuCore(object):
         stack_args.insert(0, ret_addr)
         stack_args = struct.pack(f'<{len(stack_args)}Q', *stack_args)
 
-        # define hooks
-        def hook_intr(intno: Union[int, str]):
-            try:
-                nr = SyscallX64(emu.reg_read(x86_const.UC_X86_REG_RAX))
-            except ValueError as e:
-                raise Exception(f'invalid syscall ({intno})') from e
-            else:
-                raise Exception(f'code attempted {nr.name} syscall ({intno})')
-        def hook_mem(_self, htype: int, address: int, size: int, value: int, _):
-            # FIXME: check if unmapped or skipped mapping, raise as error
-            print(f'mem: {htype} addr={address:#x} size={size} value={value}')
-        hooks = [
-            *((uc.UC_HOOK_INSN, (lambda k: lambda _self, _: hook_intr(k))(kind), None, 1, 0, ins) for ins, kind in
-                [(x86_const.UC_X86_INS_SYSCALL, 'syscall'), (x86_const.UC_X86_INS_SYSENTER, 'sysenter')]),
-            (uc.UC_HOOK_INTR, lambda _self, no, _: hook_intr(no)),
-            (uc.UC_HOOK_MEM_INVALID, hook_mem),
-        ]
-
         # emulate!
         with self.reserve(len(stack_args), align=16) as mem:
             mem.write(stack_args)
             emu.reg_write(x86_const.UC_X86_REG_RSP, mem.start)
-            try:
-                hook_handles = []
-                for hook in hooks: hook_handles.append(emu.hook_add(*hook))
-                emu.emu_start(func, ret_addr, time_limit, instruction_limit)
-            except UcError as e:
-                raise Exception(f'Unknown Unicorn error ({self.format_exec_ctx()})') from e
-            finally:
-                for hook in hook_handles: emu.hook_del(hook)
+            emu.emu_start(func, ret_addr, time_limit, instruction_limit)
             if emu.reg_read(x86_const.UC_X86_REG_RIP) != ret_addr:
-                raise Exception(f'Instruction/time limit exhausted ({self.format_exec_ctx()})')
+                raise self.__emulation_error(f'Instruction/time limit exhausted')
             assert emu.reg_read(x86_const.UC_X86_REG_RSP) == mem.start + 8
             return emu.reg_read(x86_const.UC_X86_REG_RAX)
-
-
-# stop reasons:
-#  - resources
-#  - bug in code or emulator: access to unmapped memory, prot access, illegal instruction
-#  - not supported: code uses syscall
-#  - code tried to access skipped mapping

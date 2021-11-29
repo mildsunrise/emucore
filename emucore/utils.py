@@ -8,7 +8,7 @@ from io import SEEK_CUR, SEEK_END, SEEK_SET, BytesIO, RawIOBase, UnsupportedOper
 import itertools
 import mmap
 import struct
-from typing import Any, BinaryIO, Callable, Iterator, NamedTuple, TypeVar, Union, Optional  
+from typing import Any, BinaryIO, Callable, Iterator, Literal, NamedTuple, TypeVar, Union, Optional  
 from elftools.elf.elffile import ELFFile
 from elftools.elf.structs import ELFStructs
 from elftools.elf.sections import Symbol as ELFSymbol
@@ -464,3 +464,18 @@ SYSV_AMD_ARG_REGS = [
     x86_const.UC_X86_REG_R8,
     x86_const.UC_X86_REG_R9,
 ]
+
+# Unicorn utilities
+
+MemEntry = tuple[Literal['READ', 'WRITE', 'FETCH'], Literal['OK', 'UNMAPPED', 'PROT']]
+UC_MEM_TYPES: dict[int, MemEntry] = {
+    uc.UC_MEM_READ: ('READ', 'OK'),
+    uc.UC_MEM_WRITE: ('WRITE', 'OK'),
+    uc.UC_MEM_FETCH: ('FETCH', 'OK'),
+    uc.UC_MEM_READ_UNMAPPED: ('READ', 'UNMAPPED'),
+    uc.UC_MEM_WRITE_UNMAPPED: ('WRITE', 'UNMAPPED'),
+    uc.UC_MEM_FETCH_UNMAPPED: ('FETCH', 'UNMAPPED'),
+    uc.UC_MEM_WRITE_PROT: ('WRITE', 'PROT'),
+    uc.UC_MEM_READ_PROT: ('READ', 'PROT'),
+    uc.UC_MEM_FETCH_PROT: ('FETCH', 'PROT'),
+}

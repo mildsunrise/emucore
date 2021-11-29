@@ -1,1 +1,1 @@
-from .emucore import EmuCore
+from .emucore import *
