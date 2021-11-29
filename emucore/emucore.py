@@ -3,6 +3,7 @@ Main module, exposes public API
 """
 
 import logging
+import re
 from collections import defaultdict
 import ctypes
 from io import DEFAULT_BUFFER_SIZE, BufferedRandom, BytesIO
@@ -104,7 +105,7 @@ class EmuCore(object):
 
     def __init__(
         self, filename: str,
-        patch_libc: bool=True, mapping_load_kwargs={},
+        patch_glibc: bool=True, patch_lock: bool=False, mapping_load_kwargs={},
         stack_addr: int = 0x7f10000000000000, stack_size: int = 16 * 1024 * 1024,
     ):
         '''Parses the corefile, loads the referenced files, and initializes a
@@ -119,6 +120,13 @@ class EmuCore(object):
           - `mapping_load_kwargs`: parameters passed to `__load_mappings()` that
             influence how and which files referenced by the corefile (such as
             shared libraries) are loaded. see `__load_mappings()`.
+
+          - `patch_glibc`: attempt to patch glibc codepaths that use SIMD instructions
+            we don't have, to prevent invalid instruction errors (default: True)
+
+          - `patch_lock`: patch common pthread calls to lock / unlock mutexes so that
+            they always succeed rather than fail, loop or syscall. it won't magically
+            make the data protected by them consistent, but can work (default: False)
 
           - `stack_addr`, `stack_size`: location and size of our custom stack area,
             used by `call()` and `reserve()` to emulate calls. By default a 16MiB
@@ -181,8 +189,8 @@ class EmuCore(object):
 
         # Post-load fixups
         logger.info('Performing fixups...')
-        if patch_libc:
-            self.__patch_libc()
+        if patch_glibc: self.__patch_glibc()
+        if patch_lock: self.__patch_pthreads()
 
         # Map our stack area
         self.stack_addr, self.stack_size = stack_addr, stack_size
@@ -472,9 +480,87 @@ class EmuCore(object):
 
     # PATCHES
 
-    def __patch_libc(self):
-        if not hasattr(self, 'loaded_objects'): return
-        pass # TODO
+    def __patch_glibc(self):
+        '''Patches glibc functions whose name ends in '_avx2' with a JMP to
+        their generic siblings, to prevent unsupported instructions.
+        
+        IFUNCs are defined here:
+        https://elixir.bootlin.com/glibc/glibc-2.31/source/sysdeps/i386/i686/multiarch/ifunc-impl-list.c
+        https://elixir.bootlin.com/glibc/glibc-2.31/source/sysdeps/x86_64/multiarch/ifunc-impl-list.c
+        but instead of a hardcoded list, we use a regexp to find them among symbols.
+        '''
+        # first we have to locate libc among loaded objects
+        test_sym = getattr(self, 'symbols', {}).get('strchr', [])
+        objs = { sym.obj for sym in test_sym if sym.is_callable and sym.is_exposed }
+        if len(objs) != 1:
+            logger.warn(f'cannot locate libc, found {len(objs)} candidates. skipping glibc patches...')
+            return
+        libc_obj = next(iter(objs))
+
+        # collect libc function addresses
+        collect_addresses = lambda syms: { sym.addr \
+            for sym in syms if sym.obj == libc_obj and sym.is_function }
+        libc_syms = { name: addrs for name, syms in self.symbols.items()
+            if (addrs := collect_addresses(syms)) }
+
+        # find candidates to patch
+        hunks: list[tuple[int, int]] = []
+        for name, addrs in libc_syms.items():
+            if not (m := re.fullmatch(r'(.+)_(avx|avx2|avx512)(_.+)?', name)):
+                continue
+            replacements = ['_sse2', '_sse2_unaligned']
+            replacements = [ fn for n in replacements if (fn := m.group(1) + n) in libc_syms ]
+            if not replacements:
+                logger.warn(f'cannot find replacement for {name}, not patching')
+                continue
+            target = next(iter(libc_syms[replacements[0]])) # FIXME: what if multiple?
+            hunks += [ (addr, target) for addr in addrs ]
+
+        # the dynamic linker (also provided by glibc) also has one function
+        # responsible for saving the registers. since the available registers
+        # depend on implemented SIMD extensions, we should patch that as well.
+        # locate dynamic linker through AUXV, then its symbols:
+        try:
+            ld_obj = next(obj for obj in self.loaded_objects
+                if obj.addr == self.auxv[AuxvField.BASE.value])
+        except StopIteration:
+            logger.warn(f'cannot find ld object. skipping ld patches...')
+        else:
+            ld_hunks = [
+                ('_dl_runtime_resolve_xsavec', '_dl_runtime_resolve_fxsave'),
+                ('_dl_runtime_resolve_xsave',  '_dl_runtime_resolve_fxsave'),
+                ('_dl_runtime_profile_avx512', '_dl_runtime_profile_sse'),
+                ('_dl_runtime_profile_avx',    '_dl_runtime_profile_sse'),
+            ]
+            for hunk in ld_hunks:
+                try:
+                    hunks.append(tuple( self.get_symbol(n, obj=ld_obj) for n in hunk ))
+                except ValueError:
+                    logger.warn(f'failed to patch {hunk[0]}, skiping patch...')
+
+        # patch!
+        for src, target in hunks:
+            # jmp QWORD PTR [rip] (jumps to address following instruction)
+            asm = b'\xff\x25\x00\x00\x00\x00'
+            self.mem(src).write(asm + struct.pack('<Q', target))
+
+    def __patch_pthreads(self):
+        '''We can't emulate multithreading, but we can patch mutex functions
+        so that all mutexes appear unlocked and *maybe* it will work'''
+        if not hasattr(self, 'symbols'): return
+        syms = [
+            'mutex_lock', 'mutex_trylock', 'mutex_timedlock', 'mutex_unlock',
+            'rwlock_wrlock', 'rwlock_trywrlock', 'rwlock_timedwrlock',
+            'rwlock_rdlock', 'rwlock_tryrdlock', 'rwlock_timedrdlock',
+            'rwlock_unlock',
+            'cond_signal', 'cond_broadcast',
+        ]
+        for name in syms:
+            candidates = self.get_symbols('pthread_' + name)
+            if not candidates:
+                logger.warn(f'failed to find {name}, skipping patch...')
+            for sym in candidates:
+                self.mem(sym.addr).write(b'\x48\x31\xC0\xC3')  # xor rax, rax; ret
 
     # EMULATION
 

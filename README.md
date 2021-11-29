@@ -79,11 +79,16 @@ Any coredump should work with this example, unless libc is linked statically.
 
    This includes threads / synchronization, memory management, I/O, etc. Some simple/essential syscalls like `mmap`, `sbrk` or even `write` may be implemented in the future.
 
- - Another inherent limitation of emulating a core file is that QEMU (the base for Unicorn) cannot emulate certain instruction sets like AVX2.
- 
-   In normal emulation, the code would check the supported features first and use code paths involving supported instructions. However when emulating a core file, that autodetection has probably already been done and if your software / hardware supports this instructions, it's probable you'll hit invalid instruction errors.
+ - Multithreading can't be emulated, and calls might fail or stall waiting for a mutex that was locked at the time of crash.
 
-   This isn't a big issue since code doesn't usually use these extensions, at least not the kind of code you'd want to emulate with EmuCore. The exception is libc: glibc has AVX2 implementations for string functions. This is worked around by looking through its symbols and patching `_avx2` functions with a JMP to their `_sse2` siblings. It's reliable enough, but won't work if your libc is stripped.
+   To remediate, there's an option to patch `pthread_mutex_*` and similar calls to bypass locks. It won't magically make whatever data is protected by them consistent, but you can try.  
+   In the future, we could explore things like: emulating some threads a bit until a mutex is unlocked.
+
+ - Another inherent limitation of emulating a core file is that the emulated code may use ISA extensions that are unsupported or buggy. At the time of this writing, this has been a problem with AVX2.
+
+   In normal emulation, the code would check the supported features first and use code paths involving supported instructions. However when emulating a core file, that autodetection has probably already been done and if your software / hardware supports these instructions, it's probable you'll hit invalid instruction errors.
+
+   This isn't a big issue since code doesn't usually use extensions, at least not the kind of code you'd want to emulate with EmuCore. The exceptions are libc and the dynamic linker: glibc has e.g. AVX implementations for string functions. This is worked around by looking through its symbols and patching `_avx2` functions with a JMP to their `_sse2` siblings. It's reliable enough, but won't work if your libc/ld is stripped.
 
 
 ## Wishlist
@@ -96,6 +101,7 @@ Any coredump should work with this example, unless libc is linked statically.
  - C++ support
  - Make sure it works in Python 3.8 and lower
  - Support for calling IFUNCs directly
+ - Test in static binaries, Golang binaries, and non-glibc
 
 
 
