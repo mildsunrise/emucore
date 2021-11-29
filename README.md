@@ -21,7 +21,11 @@ Dependencies:
  - [pyelftools][] to parse coredump and symbols
 
 
-## Usage
+## Examples
+
+#### Realistic example: pango_font_describe
+
+We want to get font descriptions from a gnome-shell corefile:
 
 ```python
 from emucore import EmuCore
@@ -39,6 +43,24 @@ print(f'Font name: {get_font_description(0x555a4626b4e0)}')
 ```
 
 If we were to use `get_font_description` a lot of times, we should also free the memory afterwards.
+
+#### Parsing an int
+
+To emulate a call to [`strtoul`](https://linux.die.net/man/3/strtoul), we have to
+reserve memory for input buffer and output pointer:
+
+```python
+def parse_int(text: bytes, base=10):
+    with emu.reserve(len(text)+1, align=1) as buf, emu.reserve(8) as endptr:
+        buf.write_str(text)
+        result = emu.call('strtoul', buf.start, endptr.start, base)
+        n_parsed = endptr.read_struct('<Q')[0] - buf.start
+        return result, n_parsed
+
+parse_int(b'1841 and stuff')  # prints (1841, 4)
+```
+
+Any coredump should work with this example, unless libc is linked statically.
 
 
 ## Limitations

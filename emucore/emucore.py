@@ -40,6 +40,34 @@ logger = logging.getLogger(__name__)
 REQUIRED_PROT = mmap.PROT_READ | mmap.PROT_WRITE
 
 class EmuCore(object):
+    '''Emulator for core dumps.
+
+    Once an instance is constructed and ready for use, see `call()` to invoke
+    functions. `call()` is low-level and accepts integer arguments (which may
+    be pointers) and returns the result as an integer.
+    
+    Use `mem()` to read or write memory of the emulator, and use `reserve()`
+    if you need to allocate some space on the stack. Both return a raw I/O
+    instance with some convenience methods injected into it, such as
+    `read_str()`, `read_bstr()`, `read_struct()` and its `write_` equivalents;
+    these are not present in the typings, see the `emucore.utils` module.
+
+    The corefile comes with metadata about the memory mappings and state
+    of the process / threads at the time of dump. Properties like `mappings`,
+    `auxv`, `threads`, make that info available. There's also the `find_mapping()`
+    function to query the mapping that an address falls into.
+
+    EmuCore also attempts to load info about the loaded objects and its symbols.
+    This info is available in the `loaded_objects` and `symbols` properties,
+    but it's easier to use `get_symbol()` / `get_symbols()` to query a symbol
+    by its name. To attempt to find the symbol that an address falls into, use
+    `find_symbol()` instead.
+
+    For advanced use cases, the Unicorn instance can be accessed through the
+    `emu` property. `emu_ctx` holds a Unicorn context that is restored at the
+    start of each `call()` invocation.
+    '''
+
     # open resources (FIXME: make this class a context manager)
     emu: Uc
     core: elffile.ELFFile
@@ -74,6 +102,23 @@ class EmuCore(object):
         patch_libc: bool=True, mapping_load_kwargs={},
         stack_addr: int = 0x7f10000000000000, stack_size: int = 16 * 1024 * 1024,
     ):
+        '''Parses the corefile, loads the referenced files, and initializes a
+        Unicorn emulator instance mapped with its memory.
+
+        This takes a while, enable INFO log messages to see progress.
+
+        Parameters:
+
+          - `filename`: location of corefile to load
+
+          - `mapping_load_kwargs`: parameters passed to `__load_mappings()` that
+            influence how and which files referenced by the corefile (such as
+            shared libraries) are loaded. see `__load_mappings()`.
+
+          - `stack_addr`, `stack_size`: location and size of our custom stack area,
+            used by `call()` and `reserve()` to emulate calls. By default a 16MiB
+            stack is used, in some cases you may need a bigger size.
+        '''
         # Start by opening the core file
         self.core = elffile.ELFFile(open(filename, 'rb'))
         assert self.core['e_ident']['EI_OSABI'] in {'ELFOSABI_SYSV', 'ELFOSABI_LINUX'}, \
@@ -233,7 +278,8 @@ class EmuCore(object):
 
         The `offset` parameter calls seek() on the returned stream.
 
-        If `start` is a string, it will be resolved as an OBJECT symbol.
+        If `start` is a string, it will be resolved as an `OBJECT` symbol
+        and `size` will default to the symbol size (if defined).
         If you need more control, call `get_symbol()` directly.
         '''
         if isinstance(start, str):
@@ -418,6 +464,8 @@ class EmuCore(object):
     # EMULATION
 
     def format_code_addr(self, addr: int):
+        '''Format a code address nicely by showing it as symbol + offset
+        and shared object + offset, if possible.'''
         try:
             # try to find symbol first
             sym = self.find_symbol(addr)
@@ -443,6 +491,8 @@ class EmuCore(object):
         return f'{addr:#x}'
 
     def format_exec_ctx(self):
+        '''Collect info about the current execution context and return it
+        as formatted text. Used for errors.'''
         # FIXME: backtrace?
         ip = self.format_code_addr(self.emu.reg_read(x86_const.UC_X86_REG_RIP))
         sp = self.emu.reg_read(x86_const.UC_X86_REG_RSP)
@@ -453,6 +503,20 @@ class EmuCore(object):
         self, func: Union[int, str], *args: int,
         instruction_limit: int = 10000000, time_limit: int = 0,
     ) -> int:
+        '''Emulate a function call.
+
+        The first parameter is the address of the function to call. If it
+        is a string, it will be resolved through `get_symbol()` first. The
+        arguments to the function follow, which must be integers.
+
+        If successful, returns the call result as an integer. Otherwise
+        `EmulationError` should be raised; other errors possibly indicate a bug.
+
+        Instruction or time limits can be placed on the call; the default is
+        only a 10 million instruction limit. This can be changed through the
+        `instruction_limit` and `time_limit` parameters. `0` indicate no limit,
+        and `time_limit` is in microseconds.
+        '''
         emu = self.emu
         func = self.get_symbol(func) if isinstance(func, str) else func
         ret_addr = self.stack_base
