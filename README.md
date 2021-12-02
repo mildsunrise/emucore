@@ -21,6 +21,17 @@ Dependencies:
  - [pyelftools][] to parse coredump and symbols
 
 
+## Usage
+
+Proper packaging is missing, copy the module to `site_packages` or somewhere in your path.
+
+There's a shared object (not a Python extension, just a shared object) that does the hot things such as tracing basic blocks. It's only required if you want pseudo-stacktrace support. Build with:
+
+~~~python
+make -C emucore/tracer
+~~~
+
+
 ## Examples
 
 #### Realistic example: pango_font_describe
@@ -46,8 +57,7 @@ If we were to use `get_font_description` a lot of times, we should also free the
 
 #### Parsing an int
 
-To emulate a call to [`strtoul`](https://linux.die.net/man/3/strtoul), we have to
-reserve memory for input buffer and output pointer:
+To emulate a call to [`strtoul`](https://linux.die.net/man/3/strtoul), we have to reserve memory for input buffer and output pointer:
 
 ```python
 def parse_int(text: bytes, base=10):

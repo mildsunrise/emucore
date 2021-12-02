@@ -30,6 +30,20 @@ __all__ = ['EmuCore', 'EmulationError']
 
 logger = logging.getLogger(__name__)
 
+# try to load stack tracing module
+tracer_exc = None
+try:
+    from .tracer.binding import StackTracer
+except ImportError as e:
+    tracer_exc = e
+tracer_exc_logged = False
+def is_stack_tracer_available():
+    global tracer_exc_logged
+    if not (tracer_exc is None) and not tracer_exc_logged:
+        logger.warn('stack tracing requested but not available, disabling...', exc_info=tracer_exc)
+        tracer_exc_logged = True
+    return tracer_exc is None
+
 # FIXME: a lot of these asserts should be exceptions, we should have a class
 # FIXME: proper log system
 
@@ -76,6 +90,7 @@ class EmuCore(object):
 
     # open resources (FIXME: make this class a context manager)
     emu: Uc
+    stack_tracer: 'StackTracer'
     core: elffile.ELFFile
     core_mm: mmap.mmap
     mappings_mm: dict[bytes, tuple[bytes, mmap.mmap]]
@@ -177,11 +192,13 @@ class EmuCore(object):
             (uc.UC_HOOK_INSN, lambda: self.__hook_intr('syscall'), x86_const.UC_X86_INS_SYSCALL),
             (uc.UC_HOOK_INSN, lambda: self.__hook_intr('sysenter'), x86_const.UC_X86_INS_SYSENTER),
         ]
-        self.trace_stack = trace_stack
-        if trace_stack:
-            hooks.append((uc.UC_HOOK_BLOCK, self.__hook_block))
         for hook, cb, *args in hooks:
             self.emu.hook_add(hook, (lambda cb: lambda *args: cb(*args[1:-1]))(cb), None, 1, 0, *args)
+        # setup stack tracer
+        self.stack_tracer = None
+        if trace_stack and is_stack_tracer_available():
+            self.stack_tracer = StackTracer(256)
+            self.stack_tracer.set_attached(True, self.emu)
 
         # Map everything into emulator
         if (pagesize := self.auxv[AuxvField.PAGESZ.value]) != mmap.PAGESIZE:
@@ -602,7 +619,8 @@ class EmuCore(object):
     def format_exec_ctx(self):
         '''Collect info about the current execution context and return it
         as formatted text. Used for errors.'''
-        trace = getattr(self, 'stacktrace', []) + [(
+        tracer = self.stack_tracer
+        trace = ([] if tracer is None else list(tracer.entries)) + [(
             self.emu.reg_read(x86_const.UC_X86_REG_RSP),
             self.emu.reg_read(x86_const.UC_X86_REG_RIP),
         )]
@@ -638,14 +656,6 @@ class EmuCore(object):
             raise self.__emulation_error(f'invalid syscall {nr} ({intno})') from None
         raise self.__emulation_error(f'"{nr.name}" syscall ({intno})')
 
-    trace_stack: bool
-    stacktrace: list[tuple[int, int]]
-
-    def __hook_block(self, addr, size):
-        stacktrace = self.stacktrace
-        sp = self.emu.reg_read(x86_const.UC_X86_REG_RSP)
-        while stacktrace and stacktrace[-1][0] <= sp: stacktrace.pop()
-        stacktrace.append((sp, addr + size))
     # FIXME: implement more archs and calling conventions
     def call(
         self, func: Union[int, str], *args: int,
@@ -669,7 +679,7 @@ class EmuCore(object):
         func = self.get_symbol(func) if isinstance(func, str) else func
         ret_addr = self.stack_base
         emu.context_restore(self.emu_ctx)
-        if self.trace_stack: self.stacktrace = []
+        if self.stack_tracer: self.stack_tracer.clear()
 
         # set up arguments
         assert all(isinstance(x, int) for x in args), \
