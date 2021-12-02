@@ -2,6 +2,7 @@
 Main module, exposes public API
 """
 
+from inspect import signature
 import logging
 import re
 from collections import defaultdict
@@ -24,7 +25,7 @@ from .utils import \
     parse_program_header, parse_dynamic_section, RtState, RtLoadedObject, Symbol, \
     mmapsize, elf_flags_to_uc_prot, SYSV_AMD_ARG_REGS, UC_MEM_TYPES
 
-from .syscall import SyscallX64
+from .syscall import SyscallX64, Errno, FutexCmd, FutexOp
 
 __all__ = ['EmuCore', 'EmulationError']
 
@@ -649,12 +650,24 @@ class EmuCore(object):
         raise self.__emulation_error('invalid instruction')
 
     def __hook_intr(self, intno: Union[int, Literal['syscall', 'sysenter']]):
+        if intno != 'syscall': # FIXME: x86-32
+            raise self.__emulation_error(f'invalid interrupt {intno}')
+
         nr = self.emu.reg_read(x86_const.UC_X86_REG_RAX)
         try:
             nr = SyscallX64(nr)
         except ValueError as e:
-            raise self.__emulation_error(f'invalid syscall {nr} ({intno})') from None
-        raise self.__emulation_error(f'"{nr.name}" syscall ({intno})')
+            raise self.__emulation_error(f'invalid syscall {nr}') from None
+
+        if not (handler := getattr(self, '_syscall_' + nr.name, None)):
+            raise self.__emulation_error(f'"{nr.name}" syscall')
+        nparams = len(signature(handler).parameters)
+        result = handler(*( self.emu.reg_read(r) for r in SYSV_AMD_ARG_REGS[:nparams] ))
+        if isinstance(result, Errno):
+            result = -result.value
+        else:
+            assert isinstance(result, int) and result >= 0
+        self.emu.reg_write(x86_const.UC_X86_REG_RAX, result)
 
     # FIXME: implement more archs and calling conventions
     def call(
@@ -706,3 +719,31 @@ class EmuCore(object):
                 raise self.__emulation_error(f'Instruction/time limit exhausted')
             assert emu.reg_read(x86_const.UC_X86_REG_RSP) == mem.start + 8
             return emu.reg_read(x86_const.UC_X86_REG_RAX)
+
+    # SYSCALLS
+
+    def _syscall_futex(self, uaddr: int, cmd_: int, val: int, timeout: int, uaddr2: int, val3: int):
+        try:
+            cmd = FutexCmd.load(cmd_)
+        except ValueError:
+            raise self.__emulation_error(f'invalid futex syscall {cmd_}') from None
+
+        if cmd.nr in { FutexCmd.Nr.WAKE, FutexCmd.Nr.WAKE_BITSET, FutexCmd.Nr.REQUEUE, FutexCmd.Nr.CMP_REQUEUE, FutexCmd.Nr.CMP_REQUEUE_PI, FutexCmd.Nr.WAKE_OP }:
+            # wake operations are easy to implement: there are no other threads / processes, so just return 0
+            # for some operations, we have to do prior checks / operations before the wake
+            if cmd.nr in { FutexCmd.Nr.CMP_REQUEUE, FutexCmd.Nr.CMP_REQUEUE_PI }:
+                if val3 >> 32:
+                    raise self.__emulation_error('invalid futex CMP_REQUEUE syscall: val3 not u32')
+                if self.mem(uaddr).read_struct('<I')[0] != val3:
+                    return Errno.EAGAIN
+            if cmd.nr == FutexCmd.Nr.WAKE_OP:
+                try:
+                    op = FutexOp.load(val3)
+                except ValueError:
+                    raise self.__emulation_error('invalid futex WAKE_OP syscall: val3 holds invalid op')
+                oldval = self.mem(uaddr2).read_struct('<I')[0]
+                self.mem(uaddr2).write_struct('<I', op.new_value(oldval))
+            return 0
+
+        # FIXME: if patch_lock is True, we could also patch out all waits and PI operations too
+        raise self.__emulation_error(f'futex syscall {cmd}')

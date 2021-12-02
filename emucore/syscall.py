@@ -1,6 +1,10 @@
-from enum import Enum, unique
+'''Constants / logic related to Linux syscalls.'''
 
-__all__ = ['SyscallX64']
+from enum import Enum, unique
+from typing import Callable, NamedTuple
+
+__all__ = ['SyscallX64', 'Errno', 'FutexCmd', 'FutexOp']
+
 
 @unique
 class SyscallX64(Enum):
@@ -402,3 +406,268 @@ class SyscallX64(Enum):
     old_execveat = 545
     old_preadv2 = 546
     old_pwritev2 = 547
+
+
+# from include/uapi/asm-generic/errno-base.h @ 6f52b16
+# from include/uapi/asm-generic/errno.h @ 6f52b16
+
+class Errno(Enum):
+    # BASE ERRNO VALUES
+
+    EPERM            = 1	# Operation not permitted
+    ENOENT           = 2	# No such file or directory
+    ESRCH            = 3	# No such process
+    EINTR            = 4	# Interrupted system call
+    EIO              = 5	# I/O error
+    ENXIO            = 6	# No such device or address
+    E2BIG            = 7	# Argument list too long
+    ENOEXEC          = 8	# Exec format error
+    EBADF            = 9	# Bad file number
+    ECHILD           = 10	# No child processes
+    EAGAIN           = 11	# Try again
+    ENOMEM           = 12	# Out of memory
+    EACCES           = 13	# Permission denied
+    EFAULT           = 14	# Bad address
+    ENOTBLK          = 15	# Block device required
+    EBUSY            = 16	# Device or resource busy
+    EEXIST           = 17	# File exists
+    EXDEV            = 18	# Cross-device link
+    ENODEV           = 19	# No such device
+    ENOTDIR          = 20	# Not a directory
+    EISDIR           = 21	# Is a directory
+    EINVAL           = 22	# Invalid argument
+    ENFILE           = 23	# File table overflow
+    EMFILE           = 24	# Too many open files
+    ENOTTY           = 25	# Not a typewriter
+    ETXTBSY          = 26	# Text file busy
+    EFBIG            = 27	# File too large
+    ENOSPC           = 28	# No space left on device
+    ESPIPE           = 29	# Illegal seek
+    EROFS            = 30	# Read-only file system
+    EMLINK           = 31	# Too many links
+    EPIPE            = 32	# Broken pipe
+    EDOM             = 33	# Math argument out of domain of func
+    ERANGE           = 34	# Math result not representable
+
+    # OTHER ERRNO VALUES
+
+    EDEADLK          = 35	# Resource deadlock would occur
+    ENAMETOOLONG     = 36	# File name too long
+    ENOLCK           = 37	# No record locks available
+
+    # This error code is special: arch syscall entry code will return
+    # -ENOSYS if users try to call a syscall that doesn't exist.  To keep
+    # failures of syscalls that really do exist distinguishable from
+    # failures due to attempts to use a nonexistent syscall, syscall
+    # implementations should refrain from returning -ENOSYS.
+    ENOSYS           = 38	# Invalid system call number
+
+    ENOTEMPTY        = 39	# Directory not empty
+    ELOOP            = 40	# Too many symbolic links encountered
+    EWOULDBLOCK      = EAGAIN	# Operation would block
+    ENOMSG           = 42	# No message of desired type
+    EIDRM            = 43	# Identifier removed
+    ECHRNG           = 44	# Channel number out of range
+    EL2NSYNC         = 45	# Level 2 not synchronized
+    EL3HLT           = 46	# Level 3 halted
+    EL3RST           = 47	# Level 3 reset
+    ELNRNG           = 48	# Link number out of range
+    EUNATCH          = 49	# Protocol driver not attached
+    ENOCSI           = 50	# No CSI structure available
+    EL2HLT           = 51	# Level 2 halted
+    EBADE            = 52	# Invalid exchange
+    EBADR            = 53	# Invalid request descriptor
+    EXFULL           = 54	# Exchange full
+    ENOANO           = 55	# No anode
+    EBADRQC          = 56	# Invalid request code
+    EBADSLT          = 57	# Invalid slot
+
+    EDEADLOCK        = EDEADLK
+
+    EBFONT           = 59	# Bad font file format
+    ENOSTR           = 60	# Device not a stream
+    ENODATA          = 61	# No data available
+    ETIME            = 62	# Timer expired
+    ENOSR            = 63	# Out of streams resources
+    ENONET           = 64	# Machine is not on the network
+    ENOPKG           = 65	# Package not installed
+    EREMOTE          = 66	# Object is remote
+    ENOLINK          = 67	# Link has been severed
+    EADV             = 68	# Advertise error
+    ESRMNT           = 69	# Srmount error
+    ECOMM            = 70	# Communication error on send
+    EPROTO           = 71	# Protocol error
+    EMULTIHOP        = 72	# Multihop attempted
+    EDOTDOT          = 73	# RFS specific error
+    EBADMSG          = 74	# Not a data message
+    EOVERFLOW        = 75	# Value too large for defined data type
+    ENOTUNIQ         = 76	# Name not unique on network
+    EBADFD           = 77	# File descriptor in bad state
+    EREMCHG          = 78	# Remote address changed
+    ELIBACC          = 79	# Can not access a needed shared library
+    ELIBBAD          = 80	# Accessing a corrupted shared library
+    ELIBSCN          = 81	# .lib section in a.out corrupted
+    ELIBMAX          = 82	# Attempting to link in too many shared libraries
+    ELIBEXEC         = 83	# Cannot exec a shared library directly
+    EILSEQ           = 84	# Illegal byte sequence
+    ERESTART         = 85	# Interrupted system call should be restarted
+    ESTRPIPE         = 86	# Streams pipe error
+    EUSERS           = 87	# Too many users
+    ENOTSOCK         = 88	# Socket operation on non-socket
+    EDESTADDRREQ     = 89	# Destination address required
+    EMSGSIZE         = 90	# Message too long
+    EPROTOTYPE       = 91	# Protocol wrong type for socket
+    ENOPROTOOPT      = 92	# Protocol not available
+    EPROTONOSUPPORT  = 93	# Protocol not supported
+    ESOCKTNOSUPPORT  = 94	# Socket type not supported
+    EOPNOTSUPP       = 95	# Operation not supported on transport endpoint
+    EPFNOSUPPORT     = 96	# Protocol family not supported
+    EAFNOSUPPORT     = 97	# Address family not supported by protocol
+    EADDRINUSE       = 98	# Address already in use
+    EADDRNOTAVAIL    = 99	# Cannot assign requested address
+    ENETDOWN         = 100	# Network is down
+    ENETUNREACH      = 101	# Network is unreachable
+    ENETRESET        = 102	# Network dropped connection because of reset
+    ECONNABORTED     = 103	# Software caused connection abort
+    ECONNRESET       = 104	# Connection reset by peer
+    ENOBUFS          = 105	# No buffer space available
+    EISCONN          = 106	# Transport endpoint is already connected
+    ENOTCONN         = 107	# Transport endpoint is not connected
+    ESHUTDOWN        = 108	# Cannot send after transport endpoint shutdown
+    ETOOMANYREFS     = 109	# Too many references: cannot splice
+    ETIMEDOUT        = 110	# Connection timed out
+    ECONNREFUSED     = 111	# Connection refused
+    EHOSTDOWN        = 112	# Host is down
+    EHOSTUNREACH     = 113	# No route to host
+    EALREADY         = 114	# Operation already in progress
+    EINPROGRESS      = 115	# Operation now in progress
+    ESTALE           = 116	# Stale file handle
+    EUCLEAN          = 117	# Structure needs cleaning
+    ENOTNAM          = 118	# Not a XENIX named type file
+    ENAVAIL          = 119	# No XENIX semaphores available
+    EISNAM           = 120	# Is a named type file
+    EREMOTEIO        = 121	# Remote I/O error
+    EDQUOT           = 122	# Quota exceeded
+
+    ENOMEDIUM        = 123	# No medium found
+    EMEDIUMTYPE      = 124	# Wrong medium type
+    ECANCELED        = 125	# Operation Canceled
+    ENOKEY           = 126	# Required key not available
+    EKEYEXPIRED      = 127	# Key has expired
+    EKEYREVOKED      = 128	# Key has been revoked
+    EKEYREJECTED     = 129	# Key was rejected by service
+
+    # for robust mutexes
+    EOWNERDEAD       = 130	# Owner died
+    ENOTRECOVERABLE  = 131	# State not recoverable
+
+    ERFKILL          = 132	# Operation not possible due to RF-kill
+
+    EHWPOISON        = 133	# Memory page has hardware error
+
+
+# from include/uapi/linux/futex.h @ bf69bad
+
+class FutexCmd(NamedTuple):
+    @unique
+    class Nr(Enum):
+        WAIT             = 0
+        WAKE             = 1
+        FD               = 2
+        REQUEUE          = 3
+        CMP_REQUEUE      = 4
+        WAKE_OP          = 5
+        LOCK_PI          = 6
+        UNLOCK_PI        = 7
+        TRYLOCK_PI       = 8
+        WAIT_BITSET      = 9
+        WAKE_BITSET      = 10
+        WAIT_REQUEUE_PI  = 11
+        CMP_REQUEUE_PI   = 12
+        LOCK_PI2         = 13
+
+    nr: Nr
+    private: bool
+    clock_realtime: bool
+
+    @staticmethod
+    def load(cmd: int):
+        assert isinstance(cmd, int)
+        parse_flag = lambda cmd, flag: (cmd & ~flag, bool(cmd & flag))
+        cmd, private        = parse_flag(cmd, 1 << 7)
+        cmd, clock_realtime = parse_flag(cmd, 1 << 8)
+        nr = FutexCmd.Nr(cmd)
+        return FutexCmd(nr=nr, private=private, clock_realtime=clock_realtime)
+
+    def save(self) -> int:
+        cmd = self.nr.value
+        if self.private: cmd |= 1 << 7
+        if self.clock_realtime: cmd |= 1 << 8
+        return cmd
+
+class FutexOp(NamedTuple):
+    @unique
+    class Op(Enum):
+        SET   = 0, (lambda p, arg:      arg)
+        ADD   = 1, (lambda p, arg: p +  arg)
+        OR    = 2, (lambda p, arg: p |  arg)
+        ANDN  = 3, (lambda p, arg: p & ~arg)
+        XOR   = 4, (lambda p, arg: p ^  arg)
+
+        def __new__(cls, value, *kargs):
+            obj = object.__new__(cls)
+            obj._value_ = value
+            return obj
+
+        impl: Callable[[int, int], int]
+
+        def __init__(self, _, impl):
+            self.impl = impl
+
+    @unique
+    class Cmp(Enum):
+        CMP_EQ = 0, (lambda p, arg: p == arg)
+        CMP_NE = 1, (lambda p, arg: p != arg)
+        CMP_LT = 2, (lambda p, arg: p <  arg)
+        CMP_LE = 3, (lambda p, arg: p <= arg)
+        CMP_GT = 4, (lambda p, arg: p >  arg)
+        CMP_GE = 5, (lambda p, arg: p >= arg)
+
+        def __new__(cls, value, *kargs):
+            obj = object.__new__(cls)
+            obj._value_ = value
+            return obj
+
+        impl: Callable[[int, int], bool]
+
+        def __init__(self, _, impl):
+            self.impl = impl
+
+    op: Op
+    oparg_shift: bool   # Use (1 << OPARG) instead of OPARG.
+    oparg: int
+    cmp: Cmp
+    cmparg: int
+
+    @property
+    def effective_oparg(self) -> int:
+        # FIXME: sign extension?
+        return (1 << self.oparg_shift) if self.oparg_shift else self.oparg
+    def new_value(self, old: int) -> int:
+        return self.op.impl(old, self.effective_oparg)
+    def compare(self, old: int) -> int:
+        return self.cmp.impl(old, self.cmparg)
+
+    @staticmethod
+    def load(cmd: int):
+        assert isinstance(cmd, int)
+        if cmd >> 32: raise ValueError()
+        return FutexOp(oparg_shift=bool(cmd >> 31),
+            op=FutexOp.Op((cmd >> 28) & 7), cmp=FutexOp.Cmp((cmd >> 24) & 0xF),
+            oparg=((cmd >> 12) & 0xFFF),    cmparg=((cmd) & 0xFFF))
+
+    def save(self) -> int:
+        assert not (self.oparg >> 12) and not (self.cmparg >> 12)
+        return (int(self.oparg_shift) << 31) \
+            | (self.op.value << 28) | (self.cmp.value << 24) \
+            | (self.oparg << 12)    | (self.cmparg)
