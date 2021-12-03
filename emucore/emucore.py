@@ -54,6 +54,15 @@ def is_stack_tracer_available():
 #  - if core dump's is higher: last-page rounding will not match up with the VMA rounding
 # Also, Unicorn engine page size must not be higher, checked below
 
+# FIXME: coredumpctl can tall you the build ids of everything... is that info
+# taken from the coredump file alone, or does it collect it from loaded modules
+# at the time of dump, and stores it separately?
+# FIXME: in any case, allow specifying a dictionary of build-ids to verify
+
+# FIXME: what about vdso vars and env/auxv/argv area? is it given to us in the corefile?
+# does it appear at the mappings? do gdb and kernel behave differently? should we
+# synthetize it ourselves?
+
 # minimum access required by Unicorn on mapped areas, otherwise behaviour is undefined
 REQUIRED_PROT = mmap.PROT_READ | mmap.PROT_WRITE
 
@@ -123,10 +132,13 @@ class EmuCore(object):
         self, filename: str,
         patch_glibc: bool=True, patch_lock: bool=False, mapping_load_kwargs={},
         stack_addr: int = 0x7f10000000000000, stack_size: int = 16 * 1024 * 1024,
-        trace_stack: bool = True,
+        load_symbols: bool = True, trace_stack: int = 150,
     ):
         '''Parses the corefile, loads the referenced files, and initializes a
         Unicorn emulator instance mapped with its memory.
+
+        Note that all files are opened in read mode (so nothing is tampered with),
+        but mapped anonymously so their memory is writable.
 
         This takes a while, enable INFO log messages to see progress.
 
@@ -148,10 +160,16 @@ class EmuCore(object):
           - `stack_addr`, `stack_size`: location and size of our custom stack area,
             used by `call()` and `reserve()` to emulate calls. By default a 16MiB
             stack is used, in some cases you may need a bigger size.
-        
+
+          - `load_symbols`: query all loaded objects from the linker and parse their
+            files to collect their symbols. isabling this saves some init time but
+            means you have to pass raw addresses to `call()` or `mem()` and errors
+            won't be as useful. this must be enabled in order for `patch_*` above
+            to work (default: True)
+
           - `trace_stack`: trace stack pointer at basic block boundary to be able to
-            reconstruct a sort of call stack (default: True, you may want to disable it
-            for performance)
+            reconstruct a sort of call stack. pass the desired capacity (maximum
+            entries) or 0 to disable the stack tracer (default: 150)
         '''
         # Start by opening the core file
         self.core = elffile.ELFFile(open(filename, 'rb'))
@@ -210,8 +228,7 @@ class EmuCore(object):
         self.__load_mappings(**mapping_load_kwargs)
 
         # Load symbols from binary and loaded objects
-        logger.info('Loading symbols...')
-        self.__load_symbols()
+        if load_symbols: self.__load_symbols()
 
         # Post-load fixups
         logger.info('Performing fixups...')
@@ -431,6 +448,7 @@ class EmuCore(object):
         self.loaded_objects = list(RtLoadedObject.iterate(self.mem(), r_map))
 
         # Actually load the symbols of each object
+        logger.info(f'Loading symbols for {len(self.loaded_objects)} objects...')
         self.symbols = defaultdict(lambda: set())
         by_addr = defaultdict(lambda: defaultdict(lambda: set()))
         for obj in sorted(self.loaded_objects, key=lambda x: x.addr):

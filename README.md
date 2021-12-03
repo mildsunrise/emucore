@@ -25,7 +25,7 @@ Dependencies:
 
 Proper packaging is missing, copy the module to `site_packages` or somewhere in your path.
 
-There's a shared object (not a Python extension, just a shared object) that does the hot things such as tracing basic blocks. It's only required if you want pseudo-stacktrace support. Build with:
+There's a shared object (not a Python extension, just a shared object) that does the hot things such as tracing basic blocks. It's only required if you want pseudo-stacktrace support (for errors). Build with:
 
 ~~~python
 make -C emucore/tracer
@@ -103,15 +103,18 @@ Any coredump should work with this example, unless libc is linked statically.
 
 ## Wishlist
 
+(sorted more or less by priority)
+
  - Float function arguments
- - Better errors, backtraces
- - Use debug info if available (for errors, interface)
  - More archs / OSes
  - Support for `sbrk` (so that `malloc` can always work)
  - C++ support
  - Make sure it works in Python 3.8 and lower
  - Support for calling IFUNCs directly
  - Test in static binaries, Golang binaries, and non-glibc
+ - Loading external symbol files
+ - Better errors / backtraces
+ - Use debug info if available (for errors, interface)
 
 
 
