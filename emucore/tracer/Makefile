@@ -3,7 +3,7 @@ all: tracer.so
 clean:
 	rm -rf tracer.so
 
-CFLAGS := -fPIC -O3 -Wall -Wextra -Wno-unused-parameter
+CFLAGS := -O -C panic=abort
 
-tracer.so: tracer.c
-	cc $(CFLAGS) tracer.c -shared -nostdlib -o tracer.so
+tracer.so: tracer.rs
+	rustc $(CFLAGS) tracer.rs --crate-type cdylib -C default-linker-libraries=no -o tracer.so
